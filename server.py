@@ -1,12 +1,3 @@
-"""
-GTA Heist Sync - Server
-
-A long-lived coordinator for a synchronized GTA5 panic-kill mesh.
-
-- Authoritative over every client's settings; can override one or all clients.
-- Live CLI console (type `help`) to run the session while it's up.
-- Never auto-exits. Clients can drop and re-arm without relaunching anything.
-"""
 import asyncio
 import json
 import logging
