@@ -183,7 +183,7 @@ class HeistServer:
 
         uid = hello.get("uuid") or "?"
         username = hello.get("username") or f"Player-{uid[:4]}"
-        client_ver = hello.get("version", "?")
+        client_ver = str(hello.get("version", "?"))
         if client_ver.split(".")[0] != PROTOCOL_VERSION.split(".")[0]:
             log.warning(f"{username} runs protocol {client_ver}, server is {PROTOCOL_VERSION}.")
 
@@ -194,6 +194,11 @@ class HeistServer:
             settings = normalize_settings(hello.get("settings"))
 
         existing = self.clients.get(uid)
+        if existing and existing.connected:
+            await websocket.send(json.dumps({"type": "auth_failed", "reason": "UUID already connected"}))
+            log.warning(f"Rejected duplicate connection for UUID {uid}.")
+            return
+
         if existing:  # reconnect: reuse identity, keep armed state
             existing.websocket = websocket
             existing.connected = True
@@ -201,6 +206,8 @@ class HeistServer:
             existing.settings = settings
             existing.last_heartbeat = time.monotonic()
             existing.kicked = False
+            existing.address = websocket.remote_address[0] if websocket else "?"
+            existing.game_running = hello.get("game_running", False)
             rec = existing
             log.info(f"{username} reconnected ({rec.address}).")
         else:
@@ -208,7 +215,7 @@ class HeistServer:
                 websocket, 
                 uid, 
                 username, 
-                settings=hello.get("settings"),
+                settings=settings,
                 game_running=hello.get("game_running", False)
             )
             self.clients[uid] = rec
@@ -228,7 +235,7 @@ class HeistServer:
         except Exception:
             pass
         finally:
-            await self.on_disconnect(rec)
+            await self.on_disconnect(rec, websocket)
 
     async def handle_message(self, rec, data):
         action = data.get("type")
@@ -255,7 +262,9 @@ class HeistServer:
             self.remember(rec)
             await self.push_roster()
 
-    async def on_disconnect(self, rec):
+    async def on_disconnect(self, rec, websocket):
+        if rec.websocket is not websocket:
+            return
         rec.connected = False
         rec.last_heartbeat = time.monotonic()
         log.info(f"{rec.username} disconnected.")
@@ -279,6 +288,7 @@ class HeistServer:
             await asyncio.sleep(1.0)
             now = time.monotonic()
             changed = False
+            evict = []
             for rec in self.clients.values():
                 stale = rec.connected and (now - rec.last_heartbeat) > CLIENT_TIMEOUT
                 if prev.get(rec.uuid) != stale:
@@ -286,6 +296,11 @@ class HeistServer:
                     changed = True
                     if stale:
                         log.warning(f"{rec.username} is not responding (stale heartbeat).")
+                if not rec.connected and (now - rec.last_heartbeat) > 3600:
+                    evict.append(rec.uuid)
+            for uid in evict:
+                del self.clients[uid]
+                changed = True
             if changed:
                 await self.push_roster()
 
@@ -302,6 +317,9 @@ class HeistServer:
         elif cmd in ("list", "ls", "status"):
             pass # Roster is always visible now
         elif cmd == "safe":
+            if args and parse_bool(args[0]) is None:
+                log.info(f"'{args[0]}' is not on/off.")
+                return
             mode = parse_bool(args[0]) if args else not self.safe_mode
             self.safe_mode = bool(mode)
             log.info(f"SAFE MODE {'ON — all kills suppressed' if self.safe_mode else 'OFF'}.")
@@ -321,6 +339,9 @@ class HeistServer:
                 return
             self.do_kick(args[0], schedule)
         elif cmd == "countdown":
+            if self.safe_mode:
+                log.warning("[SAFE MODE] Countdown suppressed.")
+                return
             secs = int(args[0]) if args and args[0].isdigit() else 5
             if self.armed_count() == 0:
                 log.info("Warning: No clients are ARMED. Countdown won't do anything!")
@@ -328,6 +349,20 @@ class HeistServer:
             log.info(f"Countdown ({secs}s) sent to armed players.")
         elif cmd == "set":
             self.do_set(args, schedule)
+        elif cmd == "forget":
+            if not args:
+                log.info("usage: forget <user>")
+                return
+            rec = self.find(args[0])
+            if not rec:
+                log.info(f"no client matching '{args[0]}'.")
+                return
+            if rec.connected:
+                log.info(f"Cannot forget '{rec.username}' because they are still connected.")
+                return
+            del self.clients[rec.uuid]
+            log.info(f"Forgot disconnected user {rec.username}.")
+            schedule(self.push_roster())
         elif cmd in ("arm", "disarm", "pause", "unpause"):
             if not args:
                 log.info(f"usage: {cmd} <user|all>")
@@ -337,7 +372,7 @@ class HeistServer:
             mtype = "force_arm" if cmd in ("arm", "disarm") else "force_pause"
             
             if who.lower() == "all":
-                targets = list(self.clients.values())
+                targets = [r for r in self.clients.values() if r.connected]
             else:
                 rec = self.find(who)
                 targets = [rec] if rec else []
@@ -402,7 +437,7 @@ class HeistServer:
             log.info(f"'{valstr}' is not on/off.")
             return
         if who.lower() == "all":
-            targets = list(self.clients.values())
+            targets = [r for r in self.clients.values() if r.connected]
         else:
             rec = self.find(who)
             targets = [rec] if rec else []
@@ -458,6 +493,8 @@ class ServerConsole:
                 return "set <user|all> [DiscKill | IgnDisc | IgnSrv | IgnPanic | Dry] <on|off>"
             else:
                 return "set <user|all> <setting> [on|off]"
+        elif "forget".startswith(cmd):
+            return "forget <user> - remove an offline player from the dashboard"
         elif "countdown".startswith(cmd):
             return "countdown [sec] - synchronized 3-2-1 kill"
         elif "help".startswith(cmd):
@@ -530,7 +567,10 @@ class ServerConsole:
                             if not self.history or self.history[-1] != line:
                                 self.history.append(line)
                             self.history_idx = len(self.history)
-                            self.server.dispatch_cli(line)
+                            try:
+                                self.server.dispatch_cli(line)
+                            except Exception as e:
+                                log.error(f"Error executing command: {e}")
                     elif ch == '\x08': # backspace
                         self.input_buffer = self.input_buffer[:-1]
                     elif ch == "UP":
@@ -554,21 +594,22 @@ class ServerConsole:
 
 
 def print_help():
-    print("""
-  === GTA Heist Sync — server console ===
-  list                          show every client + their toggles + health
-  safe [on|off]                 suppress ALL kills (toggle if no arg)
-  arm <user|all>                force arm a player
-  disarm <user|all>             force disarm a player
-  pause <user|all>              force pause a player
-  unpause <user|all>            force unpause a player
-  kill <user>                   targeted kill of one player only
-  kick <user>                   remove from session; game keeps running
-  set <user|all> <setting> on|off   override a client's setting(s)
-  countdown [sec]               synchronized 3-2-1 kill for armed players
-  help                          this help
-  (Ctrl+C in this window stops the server.)
-  settings: """ + ", ".join(f"{k}" for k in SETTINGS_HELP) + "\n")
+    help_text = """=== GTA Heist Sync — server console ===
+safe [on|off]                 suppress ALL kills (toggle if no arg)
+arm <user|all>                force arm a player
+disarm <user|all>             force disarm a player
+pause <user|all>              force pause a player
+unpause <user|all>            force unpause a player
+kill <user>                   targeted kill of one player only
+kick <user>                   remove from session; game keeps running
+set <user|all> <setting> on|off   override a client's setting(s)
+countdown [sec]               synchronized 3-2-1 kill for armed players
+forget <user>                 remove an offline player from the dashboard
+help                          this help
+quit / exit                   shut down the server
+(Ctrl+C in this window stops the server.)
+settings: """ + ", ".join(f"{k}" for k in SETTINGS_HELP)
+    console.print(Panel(help_text, border_style="cyan"))
 
 
 async def main():

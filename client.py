@@ -146,7 +146,7 @@ class Client:
         self.set_status(f"*** KILLED GTA — {reason} ***")
 
     def handle_kill(self, cause, reason):
-        if self.paused:
+        if self.paused and cause != "targeted":
             self.set_status(f"(paused) ignored kill [{cause}] — {reason}")
             return
         ignore = {
@@ -199,18 +199,28 @@ class Client:
             time.sleep(0.03)
         time.sleep(0.12)
         try:
+            keyboard.remove_hotkey(self.panic_keybind)
+        except Exception:
+            pass
+        try:
             new_key = keyboard.read_hotkey(suppress=False)
         except Exception:
             new_key = None
+            
+        forbidden = ["a", "d", "p", "q", "h", "k", "1", "2", "3", "4", "5"]
+        if new_key and (new_key.lower() in forbidden or new_key.lower() == "ctrl+shift+h"):
+            self.set_status(f"invalid hotkey '{new_key}' (reserved). Try again.")
+            self._register_panic()
+            self.rebinding = False
+            return
+            
         if new_key:
-            try:
-                keyboard.remove_hotkey(self.panic_keybind)
-            except Exception:
-                pass
             self.panic_keybind = new_key
             self._register_panic()
             self.save()
             self.set_status(f"panic key is now [{new_key}]")
+        else:
+            self._register_panic()
         self.rebinding = False
 
     def action_quit(self):
@@ -222,6 +232,9 @@ class Client:
 
     def action_hide(self):
         if not self.hwnd: return
+        if not getattr(self, "unhide_bound", True):
+            self.set_status("Cannot hide: unhide hotkey (ctrl+shift+h) failed to bind.")
+            return
         self.hidden = True
         ctypes.windll.user32.ShowWindow(self.hwnd, 0)
 
@@ -278,7 +291,6 @@ class Client:
         elif mtype == "kicked":
             self.armed = False
             self.set_status(f"KICKED by server — {data.get('reason','')}.")
-            self.action_quit()
         elif mtype == "settings_override":
             self.settings = normalize_settings(data.get("settings"))
             self.save()
@@ -321,6 +333,7 @@ class Client:
                     self.websocket = ws
                     self.connected = True
                     self.last_server_msg = time.monotonic()
+                    self.timeout_killed = False
                     await self._send({
                         "type": "hello", "username": self.username, "uuid": self.uuid,
                         "password": self.password, "version": PROTOCOL_VERSION,
@@ -501,7 +514,12 @@ class Client:
                 ctypes.windll.user32.EnableMenuItem(hmenu, 0xF060, 1) # SC_CLOSE, MF_GRAYED
 
         keyboard.add_hotkey(self.panic_keybind, self.do_panic)
-        keyboard.add_hotkey("ctrl+shift+h", self.toggle_visibility)
+        try:
+            keyboard.add_hotkey("ctrl+shift+h", self.toggle_visibility)
+            self.unhide_bound = True
+        except Exception as e:
+            self.set_status(f"Warning: couldn't bind unhide key (ctrl+shift+h): {e}")
+            self.unhide_bound = False
 
         threading.Thread(target=self.input_loop, daemon=True).start()
         if self.instance_socket:
