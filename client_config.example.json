@@ -1,0 +1,15 @@
+{
+  "username": "Player1",
+  "uuid": "",
+  "server_ip": "10.23.13.60",
+  "port": 8765,
+  "password": "changeme",
+  "panic_keybind": "ctrl+shift+f12",
+  "settings": {
+    "disconnect_kill": false,
+    "ignore_disconnect_kills": false,
+    "ignore_server_timeout_kills": false,
+    "ignore_other_panic": false,
+    "dry_run": false
+  }
+}

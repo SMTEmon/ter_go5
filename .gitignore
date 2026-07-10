@@ -1,0 +1,11 @@
+# Local config holds your password / identity — never commit it.
+client_config.json
+server_config.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.log
