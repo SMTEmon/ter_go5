@@ -1,6 +1,4 @@
 """
-Shared protocol, defaults and config helpers for the GTA Heist Sync tool.
-
 Both server.py and client.py import from here so the wire format and the
 setting names can never drift apart.
 """
