@@ -2,7 +2,17 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
 import sys
+
+try:
+    import websockets
+    import rich
+except ImportError:
+    print("Missing required packages. Installing from requirements.txt...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
 import threading
 import time
 
@@ -13,6 +23,7 @@ from rich.logging import RichHandler
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
+from rich import box
 
 from common import (
     PROTOCOL_VERSION, SERVER_PING_INTERVAL, CLIENT_TIMEOUT,
@@ -47,12 +58,13 @@ SETTING_COLS = [
 
 
 class ClientRecord:
-    def __init__(self, uid, username, websocket, settings):
-        self.uuid = uid
-        self.username = username
+    def __init__(self, websocket, uuid_val, username, settings=None, game_running=False):
         self.websocket = websocket
-        self.settings = settings
+        self.uuid = uuid_val
+        self.username = username
+        self.settings = normalize_settings(settings)
         self.armed = False
+        self.game_running = game_running
         self.connected = True
         self.last_heartbeat = time.monotonic()
         self.kicked = False          # intentionally removed; suppress disconnect-kill
@@ -108,6 +120,7 @@ class HeistServer:
                 "uuid": rec.uuid,
                 "username": rec.username,
                 "armed": rec.armed,
+                "game_running": rec.game_running,
                 "connected": rec.connected,
                 "stale": stale,
                 "settings": rec.settings,
@@ -191,7 +204,13 @@ class HeistServer:
             rec = existing
             log.info(f"{username} reconnected ({rec.address}).")
         else:
-            rec = ClientRecord(uid, username, websocket, settings)
+            rec = ClientRecord(
+                websocket, 
+                uid, 
+                username, 
+                settings=hello.get("settings"),
+                game_running=hello.get("game_running", False)
+            )
             self.clients[uid] = rec
             log.info(f"{username} connected ({rec.address}).")
 
@@ -226,6 +245,10 @@ class HeistServer:
         elif action == "panic":
             log.warning(f"PANIC from {rec.username}!")
             await self.trigger_kill("panic", f"Panic triggered by {rec.username}", exclude=rec.uuid)
+        elif action == "game_status":
+            rec.game_running = data.get("running", False)
+            await self.push_roster()
+            
         elif action == "settings_update":
             # Client changed its own settings locally; accept and remember.
             rec.settings = normalize_settings(data.get("settings"))
@@ -305,12 +328,14 @@ class HeistServer:
             log.info(f"Countdown ({secs}s) sent to armed players.")
         elif cmd == "set":
             self.do_set(args, schedule)
-        elif cmd in ("arm", "disarm"):
+        elif cmd in ("arm", "disarm", "pause", "unpause"):
             if not args:
                 log.info(f"usage: {cmd} <user|all>")
                 return
             who = args[0]
-            val = (cmd == "arm")
+            val = (cmd in ("arm", "pause"))
+            mtype = "force_arm" if cmd in ("arm", "disarm") else "force_pause"
+            
             if who.lower() == "all":
                 targets = list(self.clients.values())
             else:
@@ -320,8 +345,11 @@ class HeistServer:
                 log.info(f"no connected client matching '{who}'.")
                 return
             for rec in targets:
-                rec.armed = val
-                schedule(self.send(rec, {"type": "force_arm", "armed": val}))
+                if mtype == "force_arm":
+                    rec.armed = val
+                    schedule(self.send(rec, {"type": mtype, "armed": val}))
+                else:
+                    schedule(self.send(rec, {"type": mtype, "paused": val}))
             schedule(self.push_roster())
             names = ", ".join(r.username for r in targets)
             log.info(f"Forced {cmd} for: {names}")
@@ -407,7 +435,7 @@ class ServerConsole:
         parts = buf.split()
         cmd = parts[0].lower() if parts else ""
         if not buf:
-            return "Commands: arm, disarm, safe, kill, kick, set, countdown, help"
+            return "Commands: arm, disarm, pause, unpause, safe, kill, kick, set, countdown, help"
         
         if "safe".startswith(cmd):
             return "safe [on|off] - suppress ALL kills"
@@ -415,6 +443,10 @@ class ServerConsole:
             return "arm <user|all> - force arm a player"
         elif "disarm".startswith(cmd):
             return "disarm <user|all> - force disarm a player"
+        elif "pause".startswith(cmd):
+            return "pause <user|all> - force pause a player"
+        elif "unpause".startswith(cmd):
+            return "unpause <user|all> - force unpause a player"
         elif "kill".startswith(cmd):
             return "kill <user> - targeted kill of one player only"
         elif "kick".startswith(cmd):
@@ -448,29 +480,32 @@ class ServerConsole:
                  style="bold yellow" if safe else "dim"),
         )
 
-        table = Table(expand=True, header_style="bold")
-        table.add_column("Player")
+        table = Table(box=box.MINIMAL_DOUBLE_HEAD, expand=True)
+        table.add_column("Player", style="bold cyan")
         table.add_column("IP", style="dim")
         table.add_column("Conn", justify="center")
         table.add_column("Armed", justify="center")
         for _, label in SETTING_COLS:
             table.add_column(label, justify="center")
+        table.add_column("Game", justify="center")
 
         def mark(v):
             return Text("✓", style="green") if v else Text("·", style="dim")
 
         now = time.monotonic()
         if not clients:
-            table.add_row("(waiting for players...)", "", "", "", *["" for _ in SETTING_COLS])
+            table.add_row("(waiting for players...)", "", "", "", *["" for _ in SETTING_COLS], "")
         for rec in clients:
-            if rec.connected:
-                stale = (now - rec.last_heartbeat) > CLIENT_TIMEOUT
-                cs = Text("stale", style="yellow") if stale else Text("on", style="green")
+            conn = Text("ON", style="bold green") if rec.connected else Text("DISC", style="bold red")
+            armed = Text("ARM", style="bold green") if rec.armed else Text("—", style="dim")
+            
+            if not rec.connected:
+                game = Text("—", style="dim")
             else:
-                cs = Text("off", style="red")
-            armedt = Text("ARM", style="bold green") if rec.armed else Text("—", style="dim")
-            row = [Text(rec.username), Text(rec.address), cs, armedt]
-            row += [mark(rec.settings.get(k)) for k, _ in SETTING_COLS]
+                game = Text("RUNNING", style="bold green") if rec.game_running else Text("off", style="dim")
+            
+            s = rec.settings
+            row = [Text(rec.username), Text(rec.address), conn, armed] + [mark(s.get(key)) for key, _ in SETTING_COLS] + [game]
             table.add_row(*row)
 
         legend = Text(self.get_suggestion(), style="yellow")
@@ -525,6 +560,8 @@ def print_help():
   safe [on|off]                 suppress ALL kills (toggle if no arg)
   arm <user|all>                force arm a player
   disarm <user|all>             force disarm a player
+  pause <user|all>              force pause a player
+  unpause <user|all>            force unpause a player
   kill <user>                   targeted kill of one player only
   kick <user>                   remove from session; game keeps running
   set <user|all> <setting> on|off   override a client's setting(s)

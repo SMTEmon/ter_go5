@@ -3,6 +3,18 @@ import ctypes
 import os
 import subprocess
 import sys
+
+try:
+    import psutil
+    import keyboard
+    import websockets
+    import rich
+except ImportError:
+    print("Missing required packages. Installing from requirements.txt...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+import socket
 import threading
 import time
 from datetime import datetime
@@ -57,6 +69,8 @@ TOGGLE_KEYS = {
 }
 
 
+INSTANCE_PORT = 48201
+
 def kill_processes():
     """Actually close GTA5 (Enhanced + BattlEye variants)."""
     names = ["GTA5_Enhanced.exe", "GTA5_Enhanced_BE.exe", "GTA5.exe", "PlayGTAV.exe"]
@@ -70,13 +84,20 @@ def kill_processes():
 
 
 class Client:
-    def __init__(self, config):
+    def __init__(self, config, instance_socket=None):
         self.config = config
         self.username = config["username"]
         self.uuid = config["uuid"]
         self.server_ip = config["server_ip"]
         self.port = config["port"]
         self.password = config["password"]
+        self.server_mode = "normal"
+
+        self.game_running = False
+        self.hidden = False
+        self.hwnd = ctypes.windll.kernel32.GetConsoleWindow() if os.name == 'nt' else None
+        self.instance_socket = instance_socket
+
         self.panic_keybind = config.get("panic_keybind", "ctrl+shift+f12")
         self.settings = normalize_settings(config.get("settings"))
 
@@ -89,7 +110,6 @@ class Client:
         self.stop = threading.Event()
 
         self.roster = []                       # last roster from server
-        self.server_mode = "normal"
         self.last_server_msg = time.monotonic()
         self.timeout_killed = False            # avoid repeated server-timeout kills
         self.status = "Starting up..."
@@ -164,12 +184,10 @@ class Client:
         self.send_ts({"type": "settings_update", "settings": self.settings})
         self.set_status(f"{key} -> {'on' if self.settings[key] else 'off'}")
 
-    def action_rebind(self):
+    def action_rebind_panic(self):
         """Blocks the input thread while the user presses a new combo."""
         self.rebinding = True
         self.set_status("REBIND: release keys, then press the combo you want...")
-        # The 'k' that opened this is almost certainly still physically down;
-        # if we record now, read_hotkey grabs 'k'. Wait for a released keyboard.
         deadline = time.time() + 3.0
         while time.time() < deadline:
             try:
@@ -179,7 +197,7 @@ class Client:
             if not held:
                 break
             time.sleep(0.03)
-        time.sleep(0.12)  # debounce settle so a fast tap of 'k' clears too
+        time.sleep(0.12)
         try:
             new_key = keyboard.read_hotkey(suppress=False)
         except Exception:
@@ -202,6 +220,16 @@ class Client:
         if hasattr(self, "_gather_task"):
             self.loop.call_soon_threadsafe(self._gather_task.cancel)
 
+    def action_hide(self):
+        if not self.hwnd: return
+        self.hidden = True
+        ctypes.windll.user32.ShowWindow(self.hwnd, 0)
+
+    def toggle_visibility(self):
+        if not self.hwnd: return
+        self.hidden = not self.hidden
+        ctypes.windll.user32.ShowWindow(self.hwnd, 1 if not self.hidden else 0)
+
     def do_panic(self):
         self.set_status("PANIC pressed!")
         self.execute_kill("local panic")
@@ -213,6 +241,23 @@ class Client:
             keyboard.add_hotkey(self.panic_keybind, self.do_panic)
         except Exception as e:
             self.set_status(f"couldn't bind panic key: {e}")
+
+    async def game_status_loop(self):
+        """Poll psutil to check if GTA5 is running."""
+        while not self.stop.is_set():
+            running = False
+            for p in psutil.process_iter(['name']):
+                try:
+                    if p.info['name'] and p.info['name'].lower().startswith("gta5"):
+                        running = True
+                        break
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            
+            if running != self.game_running:
+                self.game_running = running
+                self.send_ts({"type": "game_status", "running": running})
+            await asyncio.sleep(3)
 
     # ---- inbound -----------------------------------------------------------
     def handle_server_message(self, data):
@@ -247,6 +292,11 @@ class Client:
             self.set_status(f"Server forced you to {'ARM' if self.armed else 'DISARM'}.")
             if self.armed:
                 self.timeout_killed = False
+        elif mtype == "force_pause":
+            self.paused = data.get("paused", False)
+            self.set_status(f"Server forced you to {'PAUSE' if self.paused else 'UNPAUSE'}.")
+            if not self.paused:
+                self.timeout_killed = False
         elif mtype == "auth_failed":
             self.auth_failed_reason = data.get('reason','')
             self.stop.set()
@@ -274,7 +324,7 @@ class Client:
                     await self._send({
                         "type": "hello", "username": self.username, "uuid": self.uuid,
                         "password": self.password, "version": PROTOCOL_VERSION,
-                        "settings": self.settings,
+                        "settings": self.settings, "game_running": self.game_running,
                     })
                     # Re-announce armed state if we were armed before a drop.
                     if self.armed:
@@ -339,6 +389,9 @@ class Client:
         table.add_column("Armed", justify="center")
         for _, label in SETTING_COLS:
             table.add_column(label, justify="center")
+        if self.server_mode == "safe":
+            table.add_column("Safe", justify="center")
+        table.add_column("Game", justify="center")
 
         def mark(v):
             return Text("✓", style="green") if v else Text("·", style="dim")
@@ -346,7 +399,7 @@ class Client:
         roster = self.roster or [{
             "username": self.username, "connected": self.connected,
             "armed": self.armed, "stale": False, "settings": self.settings,
-            "uuid": self.uuid,
+            "uuid": self.uuid, "game_running": self.game_running,
         }]
         for c in roster:
             me = c.get("uuid") == self.uuid
@@ -359,13 +412,20 @@ class Client:
             else:
                 cs = Text("on", style="green")
             armed = Text("ARM", style="bold green") if c.get("armed") else Text("—", style="dim")
+            if not c.get("connected"):
+                game = Text("—", style="dim")
+            else:
+                game = Text("RUNNING", style="bold green") if c.get("game_running") else Text("off", style="dim")
             s = c.get("settings", {})
             row = [name, cs, armed] + [mark(s.get(key)) for key, _ in SETTING_COLS]
+            if self.server_mode == "safe":
+                row.append(Text("SAFE", style="yellow"))
+            row.append(game)
             table.add_row(*row)
 
         legend = ("[A]rm  [D]isarm  [P]ause  "
                   "[1]DiscKill [2]IgnDisc [3]IgnSrv [4]IgnPanic [5]Dry  "
-                  "[K] Rebind panic  [Q]uit")
+                  "[K] Rebind panic  [H]ide  [Q]uit")
         panic = Text(f"Panic key: {self.panic_keybind}", style="bold red")
         status = Text(self.status, style="italic")
 
@@ -387,6 +447,21 @@ class Client:
                 except asyncio.CancelledError:
                     break
 
+    def listen_for_unhide(self):
+        if not self.instance_socket:
+            return
+        while not self.stop.is_set():
+            try:
+                self.instance_socket.settimeout(1.0)
+                data, _ = self.instance_socket.recvfrom(1024)
+                if data == b"UNHIDE":
+                    if self.hidden:
+                        self.toggle_visibility()
+            except socket.timeout:
+                continue
+            except Exception:
+                continue
+
     # ---- input thread ------------------------------------------------------
     def input_loop(self):
         getch = make_getch()
@@ -407,7 +482,9 @@ class Client:
             elif c in TOGGLE_KEYS:
                 self.action_toggle(TOGGLE_KEYS[c])
             elif c == "k":
-                self.action_rebind()
+                self.action_rebind_panic()
+            elif c == "h":
+                self.action_hide()
             elif c == "q":
                 self.action_quit()
                 break
@@ -415,17 +492,36 @@ class Client:
     # ---- entry -------------------------------------------------------------
     async def run(self):
         self.loop = asyncio.get_running_loop()
-        self._register_panic()
+        self.settings = normalize_settings(self.settings)
+
+        # Disable window Close button (Alt-F4/X)
+        if self.hwnd:
+            hmenu = ctypes.windll.user32.GetSystemMenu(self.hwnd, False)
+            if hmenu:
+                ctypes.windll.user32.EnableMenuItem(hmenu, 0xF060, 1) # SC_CLOSE, MF_GRAYED
+
+        keyboard.add_hotkey(self.panic_keybind, self.do_panic)
+        keyboard.add_hotkey("ctrl+shift+h", self.toggle_visibility)
+
         threading.Thread(target=self.input_loop, daemon=True).start()
+        if self.instance_socket:
+            threading.Thread(target=self.listen_for_unhide, daemon=True).start()
+            
         self.set_status(f"Ready. Press [A] to arm. Panic key: {self.panic_keybind}")
         try:
-            self._gather_task = asyncio.gather(self.connection_loop(), self.watchdog_loop(), self.tui_loop())
+            self._gather_task = asyncio.gather(
+                self.connection_loop(), 
+                self.watchdog_loop(), 
+                self.game_status_loop(),
+                self.tui_loop()
+            )
             await self._gather_task
         except asyncio.CancelledError:
             pass
         finally:
             try:
                 keyboard.remove_hotkey(self.panic_keybind)
+                keyboard.remove_hotkey("ctrl+shift+h")
             except Exception:
                 pass
 
@@ -464,11 +560,20 @@ def main():
         input("Press Enter to exit...")
         sys.exit(1)
 
+    import socket
+    instance_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        instance_socket.bind(('127.0.0.1', INSTANCE_PORT))
+    except OSError:
+        # Port is in use, another instance is running.
+        instance_socket.sendto(b"UNHIDE", ('127.0.0.1', INSTANCE_PORT))
+        sys.exit(99)
+
     config = load_config(CONFIG_FILE, CLIENT_DEFAULTS)
     first_run_setup(config)
 
     while True:
-        client = Client(config)
+        client = Client(config, instance_socket)
         try:
             asyncio.run(client.run())
         except KeyboardInterrupt:

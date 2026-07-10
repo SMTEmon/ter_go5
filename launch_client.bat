@@ -14,6 +14,7 @@ echo.
 
 :: Prefer the py launcher, fall back to python.
 where py >nul 2>&1 && ( py client.py ) || ( python client.py )
+if %ERRORLEVEL% equ 99 exit /b
 
 echo.
 echo Client stopped.
