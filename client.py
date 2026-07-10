@@ -1,13 +1,3 @@
-"""
-GTA Heist Sync - Client
-
-A long-lived, never-auto-exiting client for the panic-kill mesh.
-
-- Live dashboard (rich) of everyone connected and their toggles.
-- Single-key menu: arm, disarm, pause, flip your own toggles, rebind panic key.
-- Reconnects on its own; a kill just drops you back to a ready state.
-- The server is authoritative over settings and can override yours anytime.
-"""
 import asyncio
 import ctypes
 import os
