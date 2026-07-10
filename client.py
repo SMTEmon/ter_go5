@@ -379,9 +379,10 @@ class Client:
         return Panel(body, title=title, border_style="cyan")
 
     async def tui_loop(self):
-        with Live(get_renderable=self.render, console=console, refresh_per_second=8, screen=False) as live:
+        with Live(console=console, refresh_per_second=8, screen=False) as live:
             while not self.stop.is_set():
                 try:
+                    live.update(self.render())
                     await asyncio.sleep(0.15)
                 except asyncio.CancelledError:
                     break
