@@ -1,5 +1,5 @@
 @echo off
-title GTA Heist Sync - Server
+title ter_go5 - Server
 cd /d "%~dp0"
 echo Starting heist server... (type "help" in this window for commands)
 echo.
