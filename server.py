@@ -405,7 +405,7 @@ class ServerConsole:
         parts = buf.split()
         cmd = parts[0].lower() if parts else ""
         if not buf:
-            return "Commands: safe, kill, kick, set, countdown, help"
+            return "Commands: arm, disarm, safe, kill, kick, set, countdown, help"
         
         if "safe".startswith(cmd):
             return "safe [on|off] - suppress ALL kills"
@@ -521,6 +521,8 @@ def print_help():
   === GTA Heist Sync — server console ===
   list                          show every client + their toggles + health
   safe [on|off]                 suppress ALL kills (toggle if no arg)
+  arm <user|all>                force arm a player
+  disarm <user|all>             force disarm a player
   kill <user>                   targeted kill of one player only
   kick <user>                   remove from session; game keeps running
   set <user|all> <setting> on|off   override a client's setting(s)

@@ -445,6 +445,13 @@ def first_run_setup(config):
         if ip:
             config["server_ip"] = ip
             changed = True
+    
+    if config.get("password") == "changeme":
+        pw = input("Shared password (press Enter if host removed the password): ").strip()
+        if pw:
+            config["password"] = pw
+            changed = True
+
     if changed:
         save_config(CONFIG_FILE, config)
 
@@ -466,6 +473,7 @@ def main():
             break
             
         if getattr(client, "auth_failed_reason", None):
+            os.system('cls' if os.name == 'nt' else 'clear')
             print(f"\n[!] Connection rejected: {client.auth_failed_reason}")
             try:
                 pw = input("Enter correct server password: ").strip()
