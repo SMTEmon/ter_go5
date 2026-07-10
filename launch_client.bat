@@ -1,5 +1,5 @@
 @echo off
-title GTA Heist Sync - Client
+title ter_go5 - Client
 :: Relaunch elevated so the panic hotkey works while GTA5 is focused.
 net session >nul 2>&1
 if not %errorLevel% == 0 (
