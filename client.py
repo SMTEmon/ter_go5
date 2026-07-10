@@ -199,6 +199,8 @@ class Client:
         self.set_status("quitting...")
         self.stop.set()
         self.action_disarm()
+        if hasattr(self, "_gather_task"):
+            self.loop.call_soon_threadsafe(self._gather_task.cancel)
 
     def do_panic(self):
         self.set_status("PANIC pressed!")
@@ -239,6 +241,11 @@ class Client:
             self.loop.create_task(self._countdown(int(data.get("seconds", 5))))
         elif mtype == "notice":
             self.set_status(f"server: {data.get('msg','')}")
+        elif mtype == "force_arm":
+            self.armed = data.get("armed", False)
+            self.set_status(f"Server forced you to {'ARM' if self.armed else 'DISARM'}.")
+            if self.armed:
+                self.timeout_killed = False
         elif mtype == "auth_failed":
             self.auth_failed_reason = data.get('reason','')
             self.stop.set()
@@ -371,10 +378,12 @@ class Client:
         return Panel(body, title=title, border_style="cyan")
 
     async def tui_loop(self):
-        with Live(self.render(), console=console, refresh_per_second=8, screen=False) as live:
+        with Live(get_renderable=self.render, console=console, refresh_per_second=8, screen=False) as live:
             while not self.stop.is_set():
-                live.update(self.render())
-                await asyncio.sleep(0.15)
+                try:
+                    await asyncio.sleep(0.15)
+                except asyncio.CancelledError:
+                    break
 
     # ---- input thread ------------------------------------------------------
     def input_loop(self):
@@ -408,7 +417,10 @@ class Client:
         threading.Thread(target=self.input_loop, daemon=True).start()
         self.set_status(f"Ready. Press [A] to arm. Panic key: {self.panic_keybind}")
         try:
-            await asyncio.gather(self.connection_loop(), self.watchdog_loop(), self.tui_loop())
+            self._gather_task = asyncio.gather(self.connection_loop(), self.watchdog_loop(), self.tui_loop())
+            await self._gather_task
+        except asyncio.CancelledError:
+            pass
         finally:
             try:
                 keyboard.remove_hotkey(self.panic_keybind)

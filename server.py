@@ -303,8 +303,30 @@ class HeistServer:
             log.info(f"Countdown ({secs}s) sent to armed players.")
         elif cmd == "set":
             self.do_set(args, schedule)
+        elif cmd in ("arm", "disarm"):
+            if not args:
+                log.info(f"usage: {cmd} <user|all>")
+                return
+            who = args[0]
+            val = (cmd == "arm")
+            if who.lower() == "all":
+                targets = list(self.clients.values())
+            else:
+                rec = self.find(who)
+                targets = [rec] if rec else []
+            if not targets:
+                log.info(f"no connected client matching '{who}'.")
+                return
+            for rec in targets:
+                rec.armed = val
+                schedule(self.send(rec, {"type": "force_arm", "armed": val}))
+            schedule(self.push_roster())
+            names = ", ".join(r.username for r in targets)
+            log.info(f"Forced {cmd} for: {names}")
         elif cmd in ("quit", "exit"):
-            log.info("Use Ctrl+C in this window to stop the server.")
+            log.info("Shutting down server...")
+            import os
+            os._exit(0)
         else:
             log.info(f"unknown command '{cmd}'. Type 'help'.")
 
@@ -387,6 +409,10 @@ class ServerConsole:
         
         if "safe".startswith(cmd):
             return "safe [on|off] - suppress ALL kills"
+        elif "arm".startswith(cmd):
+            return "arm <user|all> - force arm a player"
+        elif "disarm".startswith(cmd):
+            return "disarm <user|all> - force disarm a player"
         elif "kill".startswith(cmd):
             return "kill <user> - targeted kill of one player only"
         elif "kick".startswith(cmd):
