@@ -255,22 +255,23 @@ class Client:
         except Exception as e:
             self.set_status(f"couldn't bind panic key: {e}")
 
+    def _sync_check_game(self):
+        try:
+            for proc in psutil.process_iter(['name']):
+                if proc.info['name'] and proc.info['name'].lower().startswith('gta5'):
+                    return True
+        except Exception:
+            pass
+        return False
+
     async def game_status_loop(self):
-        """Poll psutil to check if GTA5 is running."""
+        loop = asyncio.get_running_loop()
         while not self.stop.is_set():
-            running = False
-            for p in psutil.process_iter(['name']):
-                try:
-                    if p.info['name'] and p.info['name'].lower().startswith("gta5"):
-                        running = True
-                        break
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
-            
+            running = await loop.run_in_executor(None, self._sync_check_game)
             if running != self.game_running:
                 self.game_running = running
-                self.send_ts({"type": "game_status", "running": running})
-            await asyncio.sleep(3)
+                await self._send({"type": "game_status", "running": running})
+            await asyncio.sleep(3.0)
 
     # ---- inbound -----------------------------------------------------------
     def handle_server_message(self, data):

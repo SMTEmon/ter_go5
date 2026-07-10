@@ -66,6 +66,7 @@ class ClientRecord:
         self.armed = False
         self.game_running = game_running
         self.connected = True
+        self.dropping = False
         self.last_heartbeat = time.monotonic()
         self.kicked = False          # intentionally removed; suppress disconnect-kill
         self.address = websocket.remote_address[0] if websocket else "?"
@@ -194,12 +195,11 @@ class HeistServer:
             settings = normalize_settings(hello.get("settings"))
 
         existing = self.clients.get(uid)
-        if existing and existing.connected:
-            await websocket.send(json.dumps({"type": "auth_failed", "reason": "UUID already connected"}))
-            log.warning(f"Rejected duplicate connection for UUID {uid}.")
-            return
-
-        if existing:  # reconnect: reuse identity, keep armed state
+        if existing:  # reconnect or take over a stale still-open socket; keep armed state
+            old_ws = existing.websocket if existing.connected else None
+            # Repoint to the NEW socket FIRST, so when the old socket's
+            # handle_client finally-block runs on_disconnect(existing, old_ws),
+            # the `rec.websocket is not websocket` guard makes it a no-op.
             existing.websocket = websocket
             existing.connected = True
             existing.username = username
@@ -209,7 +209,14 @@ class HeistServer:
             existing.address = websocket.remote_address[0] if websocket else "?"
             existing.game_running = hello.get("game_running", False)
             rec = existing
-            log.info(f"{username} reconnected ({rec.address}).")
+            if old_ws is not None:
+                try:
+                    await old_ws.close()
+                except Exception:
+                    pass
+                log.warning(f"{username} reconnected; replaced a stale open socket.")
+            else:
+                log.info(f"{username} reconnected ({rec.address}).")
         else:
             rec = ClientRecord(
                 websocket, 
@@ -266,6 +273,7 @@ class HeistServer:
         if rec.websocket is not websocket:
             return
         rec.connected = False
+        rec.dropping = False
         rec.last_heartbeat = time.monotonic()
         log.info(f"{rec.username} disconnected.")
         await self.push_roster()
@@ -282,6 +290,12 @@ class HeistServer:
             await asyncio.sleep(SERVER_PING_INTERVAL)
             await self.broadcast({"type": "ping", "t": time.time()})
 
+    async def _force_close(self, websocket):
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
     async def stale_watch_loop(self):
         prev = {}
         while True:
@@ -289,13 +303,21 @@ class HeistServer:
             now = time.monotonic()
             changed = False
             evict = []
-            for rec in self.clients.values():
+            for rec in list(self.clients.values()):
                 stale = rec.connected and (now - rec.last_heartbeat) > CLIENT_TIMEOUT
                 if prev.get(rec.uuid) != stale:
                     prev[rec.uuid] = stale
                     changed = True
                     if stale:
                         log.warning(f"{rec.username} is not responding (stale heartbeat).")
+                # A client silent for much longer than "stale" is treated as gone:
+                # close its socket so handle_client's finally runs on_disconnect
+                # (which handles the grace window / disconnect-kill correctly).
+                if (rec.connected and not getattr(rec, "dropping", False)
+                        and (now - rec.last_heartbeat) > CLIENT_TIMEOUT * 2):
+                    rec.dropping = True
+                    log.warning(f"{rec.username} silent too long; dropping the connection.")
+                    self.loop.create_task(self._force_close(rec.websocket))
                 if not rec.connected and (now - rec.last_heartbeat) > 3600:
                     evict.append(rec.uuid)
             for uid in evict:
@@ -618,14 +640,14 @@ async def main():
     server.loop = asyncio.get_running_loop()
 
     threading.Thread(target=ServerConsole(server).run, daemon=True).start()
-    server.loop.create_task(server.keepalive_loop())
-    server.loop.create_task(server.stale_watch_loop())
 
     log.info(f"Heist server listening on {config['host']}:{config['port']} (protocol {PROTOCOL_VERSION}).")
     if config["password"] == "changeme":
         log.warning("Password is still 'changeme' — edit server_config.json and share it with players.")
 
-    async with websockets.serve(server.handle_client, config["host"], config["port"]):
+    async with websockets.serve(server.handle_client, config["host"], config["port"], ping_interval=None, ping_timeout=None):
+        server.loop.create_task(server.stale_watch_loop())
+        server.loop.create_task(server.keepalive_loop())
         await asyncio.Future()
 
 
