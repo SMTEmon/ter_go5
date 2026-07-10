@@ -232,13 +232,14 @@ class Client:
             self.handle_kill(data.get("cause", "?"), data.get("reason", ""))
         elif mtype == "kicked":
             self.armed = False
-            self.set_status(f"KICKED by server — {data.get('reason','')}. Press [A] to re-arm.")
+            self.set_status(f"KICKED by server — {data.get('reason','')}.")
+            self.action_quit()
         elif mtype == "settings_override":
             self.settings = normalize_settings(data.get("settings"))
             self.save()
             self.set_status("settings changed by server operator.")
         elif mtype == "countdown":
-            self.loop.create_task(self._countdown(int(data.get("seconds", 5))))
+            self._countdown_task = self.loop.create_task(self._countdown(int(data.get("seconds", 5))))
         elif mtype == "notice":
             self.set_status(f"server: {data.get('msg','')}")
         elif mtype == "force_arm":

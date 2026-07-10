@@ -299,6 +299,8 @@ class HeistServer:
             self.do_kick(args[0], schedule)
         elif cmd == "countdown":
             secs = int(args[0]) if args and args[0].isdigit() else 5
+            if self.armed_count() == 0:
+                log.info("Warning: No clients are ARMED. Countdown won't do anything!")
             schedule(self.broadcast({"type": "countdown", "seconds": secs}, only_armed=True))
             log.info(f"Countdown ({secs}s) sent to armed players.")
         elif cmd == "set":
