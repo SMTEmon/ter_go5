@@ -161,6 +161,8 @@ class Client:
 
     # ---- menu actions (called from the input thread) ----------------------
     def action_arm(self):
+        if getattr(self, "suspended", False):
+            self.suspended = False
         if not self.connected:
             self.set_status("can't arm — not connected.")
             return
@@ -171,12 +173,17 @@ class Client:
 
     def action_disarm(self):
         self.armed = False
+        if hasattr(self, "_countdown_task") and not self._countdown_task.done():
+            self.loop.call_soon_threadsafe(self._countdown_task.cancel)
         self.send_ts({"type": "disarm"})
         self.set_status("disarmed — opted out.")
 
     def action_pause(self):
         self.paused = not self.paused
-        self.set_status("PAUSED — ignoring all kills." if self.paused else "resumed.")
+        if not self.paused and getattr(self, "timeout_killed", False):
+            self.set_status("resumed (server silent while paused — won't self-kill).")
+        else:
+            self.set_status("PAUSED — ignoring all kills." if self.paused else "resumed.")
 
     def action_toggle(self, key):
         self.settings[key] = not self.settings.get(key)
@@ -226,9 +233,20 @@ class Client:
     def action_quit(self):
         self.set_status("quitting...")
         self.stop.set()
-        self.action_disarm()
-        if hasattr(self, "_gather_task"):
-            self.loop.call_soon_threadsafe(self._gather_task.cancel)
+        if hasattr(self, "_gather_task") and self.loop and self.connected:
+            async def _shutdown():
+                self.armed = False
+                await self._send({"type": "disarm"})
+                try:
+                    await asyncio.wait_for(self.websocket.close(code=1000), timeout=1.5)
+                except Exception:
+                    pass
+                self.loop.call_soon_threadsafe(self._gather_task.cancel)
+            asyncio.run_coroutine_threadsafe(_shutdown(), self.loop)
+        else:
+            self.action_disarm()
+            if hasattr(self, "_gather_task"):
+                self.loop.call_soon_threadsafe(self._gather_task.cancel)
 
     def action_hide(self):
         if not self.hwnd: return
@@ -257,8 +275,18 @@ class Client:
 
     def _sync_check_game(self):
         try:
+            if hasattr(self, "_game_pid"):
+                try:
+                    proc = psutil.Process(self._game_pid)
+                    if proc.is_running() and proc.name().lower().startswith('gta5'):
+                        return True
+                except psutil.NoSuchProcess:
+                    pass
+                delattr(self, "_game_pid")
+                
             for proc in psutil.process_iter(['name']):
                 if proc.info['name'] and proc.info['name'].lower().startswith('gta5'):
+                    self._game_pid = proc.pid
                     return True
         except Exception:
             pass
@@ -286,36 +314,52 @@ class Client:
             self.roster = data.get("clients", [])
             self.server_mode = data.get("server_mode", "normal")
         elif mtype == "ping":
-            pass
+            self.send_ts({"type": "pong", "t": data.get("t")})
         elif mtype == "kill":
             self.handle_kill(data.get("cause", "?"), data.get("reason", ""))
         elif mtype == "kicked":
             self.armed = False
-            self.set_status(f"KICKED by server — {data.get('reason','')}.")
+            self.suspended = True
+            if hasattr(self, "_countdown_task") and not self._countdown_task.done():
+                self._countdown_task.cancel()
+            self.set_status(f"KICKED by server — {data.get('reason','')}. Press [A] to reconnect.")
         elif mtype == "settings_override":
             self.settings = normalize_settings(data.get("settings"))
             self.save()
             self.set_status("settings changed by server operator.")
         elif mtype == "countdown":
+            if hasattr(self, "_countdown_task") and not self._countdown_task.done():
+                self._countdown_task.cancel()
             self._countdown_task = self.loop.create_task(self._countdown(int(data.get("seconds", 5))))
+        elif mtype == "countdown_abort":
+            if hasattr(self, "_countdown_task") and not self._countdown_task.done():
+                self._countdown_task.cancel()
+            self.set_status("server aborted countdown.")
         elif mtype == "notice":
             self.set_status(f"server: {data.get('msg','')}")
         elif mtype == "force_arm":
             self.armed = data.get("armed", False)
+            if not self.armed:
+                if hasattr(self, "_countdown_task") and not self._countdown_task.done():
+                    self._countdown_task.cancel()
             self.set_status(f"Server forced you to {'ARM' if self.armed else 'DISARM'}.")
             if self.armed:
                 self.timeout_killed = False
         elif mtype == "force_pause":
             self.paused = data.get("paused", False)
-            self.set_status(f"Server forced you to {'PAUSE' if self.paused else 'UNPAUSE'}.")
-            if not self.paused:
-                self.timeout_killed = False
+            if not self.paused and getattr(self, "timeout_killed", False):
+                self.set_status("Server UNPAUSED you (server was silent — won't self-kill).")
+            else:
+                self.set_status(f"Server forced you to {'PAUSE' if self.paused else 'UNPAUSE'}.")
         elif mtype == "auth_failed":
             self.auth_failed_reason = data.get('reason','')
             self.stop.set()
 
     async def _countdown(self, seconds):
         for n in range(seconds, 0, -1):
+            if not self.armed:
+                self.set_status("(disarmed) countdown ignored.")
+                return
             if self.paused:
                 self.set_status("(paused) countdown ignored.")
                 return
@@ -328,6 +372,9 @@ class Client:
     async def connection_loop(self):
         uri = f"ws://{self.server_ip}:{self.port}"
         while not self.stop.is_set():
+            if getattr(self, "suspended", False):
+                await asyncio.sleep(1.0)
+                continue
             try:
                 self.set_status(f"connecting to {uri} ...")
                 async with websockets.connect(uri) as ws:
@@ -372,8 +419,13 @@ class Client:
         while not self.stop.is_set():
             await asyncio.sleep(0.5)
             silent = time.monotonic() - self.last_server_msg
-            if (self.armed and not self.paused and not self.timeout_killed
-                    and silent > SERVER_TIMEOUT):
+            if not self.armed:
+                continue
+            if self.paused:
+                if silent > SERVER_TIMEOUT:
+                    self.timeout_killed = True
+                continue
+            if not self.timeout_killed and silent > SERVER_TIMEOUT:
                 self.timeout_killed = True
                 if self.settings.get("ignore_server_timeout_kills"):
                     self.set_status("server silent — ignored (toggle on).")
@@ -400,6 +452,7 @@ class Client:
         table = Table(expand=True, header_style="bold")
         table.add_column("Player")
         table.add_column("Conn", justify="center")
+        table.add_column("Ping", justify="right")
         table.add_column("Armed", justify="center")
         for _, label in SETTING_COLS:
             table.add_column(label, justify="center")
@@ -425,13 +478,21 @@ class Client:
                 cs = Text("stale", style="yellow")
             else:
                 cs = Text("on", style="green")
+            
+            ping_ms = c.get("ping_ms", -1)
+            if ping_ms < 0 or not c.get("connected"):
+                ping_txt = Text("—", style="dim")
+            else:
+                color = "green" if ping_ms < 100 else "yellow" if ping_ms < 250 else "red"
+                ping_txt = Text(f"{int(ping_ms)}ms", style=color)
+                
             armed = Text("ARM", style="bold green") if c.get("armed") else Text("—", style="dim")
             if not c.get("connected"):
                 game = Text("—", style="dim")
             else:
                 game = Text("RUNNING", style="bold green") if c.get("game_running") else Text("off", style="dim")
             s = c.get("settings", {})
-            row = [name, cs, armed] + [mark(s.get(key)) for key, _ in SETTING_COLS]
+            row = [name, cs, ping_txt, armed] + [mark(s.get(key)) for key, _ in SETTING_COLS]
             if self.server_mode == "safe":
                 row.append(Text("SAFE", style="yellow"))
             row.append(game)

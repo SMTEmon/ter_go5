@@ -9,6 +9,11 @@ if not %errorLevel% == 0 (
 )
 
 cd /d "%~dp0"
+
+echo Checking for updates from GitHub...
+where git >nul 2>&1 && git pull || echo (Git not installed, skipping update)
+echo.
+
 echo [OK] Running as Administrator. Starting client...
 echo.
 

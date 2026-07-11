@@ -70,6 +70,7 @@ class ClientRecord:
         self.last_heartbeat = time.monotonic()
         self.kicked = False          # intentionally removed; suppress disconnect-kill
         self.address = websocket.remote_address[0] if websocket else "?"
+        self.ping_ms = -1
 
 
 class HeistServer:
@@ -125,6 +126,7 @@ class HeistServer:
                 "connected": rec.connected,
                 "stale": stale,
                 "settings": rec.settings,
+                "ping_ms": rec.ping_ms,
             })
         return {"type": "roster", "server_mode": "safe" if self.safe_mode else "normal",
                 "grace": self.grace, "clients": clients}
@@ -151,13 +153,15 @@ class HeistServer:
         log.warning(f"KILL broadcast ({cause}) to armed players: {reason}")
         await self.broadcast(msg, only_armed=True, exclude=exclude)
 
-    async def schedule_disconnect_kill(self, rec):
+    async def schedule_disconnect_kill(self, rec, drop_seq=None):
         """Wait the grace window; if the armed player hasn't returned, kill."""
         uid, name = rec.uuid, rec.username
         await asyncio.sleep(self.grace)
         current = self.clients.get(uid)
         if current and current.connected:
             return  # they reconnected in time
+        if drop_seq is not None and getattr(current, 'drop_seq', None) != drop_seq:
+            return
         log.warning(f"Grace expired for {name}; triggering disconnect kill.")
         await self.trigger_kill("disconnect", f"{name} dropped and did not return")
 
@@ -238,7 +242,12 @@ class HeistServer:
 
         try:
             async for raw in websocket:
-                await self.handle_message(rec, json.loads(raw))
+                try:
+                    data = json.loads(raw)
+                except json.JSONDecodeError:
+                    log.warning(f"Malformed JSON from {rec.username if rec else 'unknown'}")
+                    continue
+                await self.handle_message(rec, data)
         except Exception:
             pass
         finally:
@@ -248,6 +257,11 @@ class HeistServer:
         action = data.get("type")
         if action == "heartbeat":
             rec.last_heartbeat = time.monotonic()
+        elif action == "pong":
+            t = data.get("t")
+            if t is not None:
+                rec.ping_ms = (time.time() - t) * 1000
+                rec.last_heartbeat = time.monotonic()
         elif action == "arm":
             rec.armed = True
             log.info(f"{rec.username} ARMED. ({self.armed_count()} armed)")
@@ -278,8 +292,12 @@ class HeistServer:
         log.info(f"{rec.username} disconnected.")
         await self.push_roster()
         if rec.armed and rec.settings.get("disconnect_kill") and not rec.kicked and not self.safe_mode:
-            log.warning(f"Armed {rec.username} dropped; grace timer ({self.grace}s) started.")
-            self.loop.create_task(self.schedule_disconnect_kill(rec))
+            if getattr(websocket, "close_code", None) == 1000:
+                log.info(f"{rec.username} closed cleanly; skipping disconnect kill.")
+            else:
+                log.warning(f"Armed {rec.username} dropped; grace timer ({self.grace}s) started.")
+                rec.drop_seq = getattr(rec, 'drop_seq', 0) + 1
+                self.loop.create_task(self.schedule_disconnect_kill(rec, rec.drop_seq))
 
     def armed_count(self):
         return sum(1 for r in self.clients.values() if r.armed and r.connected)
@@ -289,6 +307,7 @@ class HeistServer:
         while True:
             await asyncio.sleep(SERVER_PING_INTERVAL)
             await self.broadcast({"type": "ping", "t": time.time()})
+            await self.push_roster()
 
     async def _force_close(self, websocket):
         try:
@@ -338,13 +357,19 @@ class HeistServer:
             print_help()
         elif cmd in ("list", "ls", "status"):
             pass # Roster is always visible now
-        elif cmd == "safe":
+        elif cmd in ("safe", "abort"):
+            if cmd == "abort":
+                schedule(self.broadcast({"type": "countdown_abort"}, only_armed=True))
+                log.info("Countdown abort sent.")
+                return
             if args and parse_bool(args[0]) is None:
                 log.info(f"'{args[0]}' is not on/off.")
                 return
             mode = parse_bool(args[0]) if args else not self.safe_mode
             self.safe_mode = bool(mode)
             log.info(f"SAFE MODE {'ON — all kills suppressed' if self.safe_mode else 'OFF'}.")
+            if self.safe_mode:
+                schedule(self.broadcast({"type": "countdown_abort"}, only_armed=True))
             schedule(self.push_roster())
         elif cmd == "kill":
             if not args:
@@ -543,6 +568,7 @@ class ServerConsole:
         table.add_column("Player", style="bold cyan")
         table.add_column("IP", style="dim")
         table.add_column("Conn", justify="center")
+        table.add_column("Ping", justify="right")
         table.add_column("Armed", justify="center")
         for _, label in SETTING_COLS:
             table.add_column(label, justify="center")
@@ -563,8 +589,15 @@ class ServerConsole:
             else:
                 game = Text("RUNNING", style="bold green") if rec.game_running else Text("off", style="dim")
             
+            ping_ms = rec.ping_ms
+            if ping_ms < 0 or not rec.connected:
+                ping_txt = Text("—", style="dim")
+            else:
+                color = "green" if ping_ms < 100 else "yellow" if ping_ms < 250 else "red"
+                ping_txt = Text(f"{int(ping_ms)}ms", style=color)
+            
             s = rec.settings
-            row = [Text(rec.username), Text(rec.address), conn, armed] + [mark(s.get(key)) for key, _ in SETTING_COLS] + [game]
+            row = [Text(rec.username), Text(rec.address), conn, ping_txt, armed] + [mark(s.get(key)) for key, _ in SETTING_COLS] + [game]
             table.add_row(*row)
 
         legend = Text(self.get_suggestion(), style="yellow")
