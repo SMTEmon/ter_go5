@@ -4,6 +4,7 @@ import logging
 import os
 import subprocess
 import sys
+import uuid
 
 try:
     import websockets
@@ -71,6 +72,9 @@ class ClientRecord:
         self.kicked = False          # intentionally removed; suppress disconnect-kill
         self.address = websocket.remote_address[0] if websocket else "?"
         self.ping_ms = -1
+        self.mesh_port = 0
+        self.mesh_seen = set()
+        self.mesh_seen_at = 0.0
 
 
 class HeistServer:
@@ -127,6 +131,8 @@ class HeistServer:
                 "stale": stale,
                 "settings": rec.settings,
                 "ping_ms": rec.ping_ms,
+                "ip": rec.address,
+                "mesh_port": rec.mesh_port,
             })
         return {"type": "roster", "server_mode": "safe" if self.safe_mode else "normal",
                 "grace": self.grace, "clients": clients}
@@ -135,14 +141,14 @@ class HeistServer:
         await self.broadcast(self.roster_payload())
 
     # ---- kills -------------------------------------------------------------
-    async def trigger_kill(self, cause, reason, exclude=None, target=None):
+    async def trigger_kill(self, cause, reason, exclude=None, target=None, event_id=None):
         """Broadcast a kill. Clients enforce their own ignore-toggles except
         for a targeted kill, which always lands."""
         if cause != "targeted" and self.safe_mode:
             log.warning(f"[SAFE MODE] Kill suppressed ({cause}): {reason}")
             return
 
-        msg = {"type": "kill", "cause": cause, "reason": reason}
+        msg = {"type": "kill", "cause": cause, "reason": reason, "event_id": event_id or uuid.uuid4().hex}
         if target:
             rec = self.clients.get(target)
             if rec and rec.connected:
@@ -157,11 +163,27 @@ class HeistServer:
         """Wait the grace window; if the armed player hasn't returned, kill."""
         uid, name = rec.uuid, rec.username
         await asyncio.sleep(self.grace)
-        current = self.clients.get(uid)
-        if current and current.connected:
-            return  # they reconnected in time
-        if drop_seq is not None and getattr(current, 'drop_seq', None) != drop_seq:
-            return
+        last_log = 0
+        while True:
+            current = self.clients.get(uid)
+            if current and current.connected:
+                return  # they reconnected in time
+            if drop_seq is not None and getattr(current, 'drop_seq', None) != drop_seq:
+                return
+            if not self.config.get("mesh_corroboration", True):
+                break
+            now = time.monotonic()
+            witnesses = [r.username for r in self.clients.values()
+                         if r.connected and r.uuid != uid
+                         and (now - r.mesh_seen_at) <= CLIENT_TIMEOUT
+                         and uid in r.mesh_seen]
+            if not witnesses:
+                break
+            if now - last_log > 5.0:
+                log.warning(f"{name} lost server link but is mesh-visible to {', '.join(witnesses)}; deferring disconnect kill.")
+                last_log = now
+            await asyncio.sleep(1.0)
+            
         log.warning(f"Grace expired for {name}; triggering disconnect kill.")
         await self.trigger_kill("disconnect", f"{name} dropped and did not return")
 
@@ -212,6 +234,7 @@ class HeistServer:
             existing.kicked = False
             existing.address = websocket.remote_address[0] if websocket else "?"
             existing.game_running = hello.get("game_running", False)
+            existing.mesh_port = int(hello.get("mesh_port", 0) or 0)
             rec = existing
             if old_ws is not None:
                 try:
@@ -229,6 +252,7 @@ class HeistServer:
                 settings=settings,
                 game_running=hello.get("game_running", False)
             )
+            rec.mesh_port = int(hello.get("mesh_port", 0) or 0)
             self.clients[uid] = rec
             log.info(f"{username} connected ({rec.address}).")
 
@@ -257,6 +281,10 @@ class HeistServer:
         action = data.get("type")
         if action == "heartbeat":
             rec.last_heartbeat = time.monotonic()
+            seen = data.get("mesh_seen")
+            if isinstance(seen, list):
+                rec.mesh_seen = {str(u) for u in seen}
+                rec.mesh_seen_at = time.monotonic()
         elif action == "pong":
             t = data.get("t")
             if t is not None:
@@ -272,7 +300,7 @@ class HeistServer:
             await self.push_roster()
         elif action == "panic":
             log.warning(f"PANIC from {rec.username}!")
-            await self.trigger_kill("panic", f"Panic triggered by {rec.username}", exclude=rec.uuid)
+            await self.trigger_kill("panic", f"Panic triggered by {rec.username}", exclude=rec.uuid, event_id=data.get("event_id"))
         elif action == "game_status":
             rec.game_running = data.get("running", False)
             await self.push_roster()
@@ -569,6 +597,7 @@ class ServerConsole:
         table.add_column("IP", style="dim")
         table.add_column("Conn", justify="center")
         table.add_column("Ping", justify="right")
+        table.add_column("Mesh", justify="center")
         table.add_column("Armed", justify="center")
         for _, label in SETTING_COLS:
             table.add_column(label, justify="center")
@@ -596,8 +625,11 @@ class ServerConsole:
                 color = "green" if ping_ms < 100 else "yellow" if ping_ms < 250 else "red"
                 ping_txt = Text(f"{int(ping_ms)}ms", style=color)
             
+            mesh_count = sum(1 for r in clients if r.connected and rec.uuid in r.mesh_seen and (now - r.mesh_seen_at) <= CLIENT_TIMEOUT)
+            mesh_txt = Text(f"{mesh_count}✓", style="green") if mesh_count > 0 else Text("—", style="dim")
+            
             s = rec.settings
-            row = [Text(rec.username), Text(rec.address), conn, ping_txt, armed] + [mark(s.get(key)) for key, _ in SETTING_COLS] + [game]
+            row = [Text(rec.username), Text(rec.address), conn, ping_txt, mesh_txt, armed] + [mark(s.get(key)) for key, _ in SETTING_COLS] + [game]
             table.add_row(*row)
 
         legend = Text(self.get_suggestion(), style="yellow")

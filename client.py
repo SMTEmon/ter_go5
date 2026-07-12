@@ -3,6 +3,7 @@ import ctypes
 import os
 import subprocess
 import sys
+import uuid
 
 try:
     import psutil
@@ -31,6 +32,7 @@ from common import (
     PROTOCOL_VERSION, HEARTBEAT_INTERVAL, SERVER_TIMEOUT,
     DEFAULT_SETTINGS, SETTINGS_HELP, normalize_settings,
     load_config, save_config, CLIENT_DEFAULTS, make_getch,
+    MESH_PORT, MESH_EVENT_TTL,
 )
 
 CONFIG_FILE = "client_config.json"
@@ -69,7 +71,6 @@ TOGGLE_KEYS = {
 }
 
 
-INSTANCE_PORT = 48201
 
 def kill_processes():
     """Actually close GTA5 (Enhanced + BattlEye variants)."""
@@ -113,6 +114,13 @@ class Client:
         self.last_server_msg = time.monotonic()
         self.timeout_killed = False            # avoid repeated server-timeout kills
         self.status = "Starting up..."
+        
+        self.mesh_enabled = bool(config.get("mesh_enabled", True))
+        self.mesh_port = int(config.get("mesh_port", MESH_PORT))
+        self.mesh = None
+        self.mode = "OFFLINE"
+        self.kill_events = {}
+        self.last_server_mode_safe = False
 
     # ---- status / persistence ---------------------------------------------
     def set_status(self, msg):
@@ -123,6 +131,8 @@ class Client:
         self.config["panic_keybind"] = self.panic_keybind
         self.config["server_ip"] = self.server_ip
         self.config["password"] = self.password
+        if "known_peers" not in self.config:
+            self.config["known_peers"] = {}
         save_config(CONFIG_FILE, self.config)
 
     # ---- outbound ----------------------------------------------------------
@@ -145,9 +155,21 @@ class Client:
         kill_processes()
         self.set_status(f"*** KILLED GTA — {reason} ***")
 
-    def handle_kill(self, cause, reason):
-        if self.paused and cause != "targeted":
-            self.set_status(f"(paused) ignored kill [{cause}] — {reason}")
+    def handle_kill(self, cause, reason, event_id=None):
+        if event_id:
+            now = time.monotonic()
+            self.kill_events = {k: v for k, v in self.kill_events.items() if (now - v) <= MESH_EVENT_TTL}
+            if event_id in self.kill_events:
+                return
+            self.kill_events[event_id] = now
+            
+        if not self.armed and cause != "targeted":
+            self.set_status(f"(disarmed) ignored kill [{cause}] — {reason}")
+            return
+            
+        if (self.paused or self.last_server_mode_safe) and cause != "targeted":
+            prefix = "paused" if self.paused else "safe mode"
+            self.set_status(f"({prefix}) ignored kill [{cause}] — {reason}")
             return
         ignore = {
             "disconnect": "ignore_disconnect_kills",
@@ -159,12 +181,15 @@ class Client:
         self.execute_kill(reason)
         self.armed = False  # drop to ready state; re-arm to rejoin
 
+    def on_mesh_kill(self, cause, reason, event_id, from_name):
+        self.handle_kill(cause, f"{reason} (via mesh from {from_name})", event_id)
+
     # ---- menu actions (called from the input thread) ----------------------
     def action_arm(self):
         if getattr(self, "suspended", False):
             self.suspended = False
-        if not self.connected:
-            self.set_status("can't arm — not connected.")
+        if not self.connected and not (self.mesh and self.mesh.alive_peers()):
+            self.set_status("can't arm — no server and no peers.")
             return
         self.armed = True
         self.timeout_killed = False
@@ -262,9 +287,22 @@ class Client:
         ctypes.windll.user32.ShowWindow(self.hwnd, 1 if not self.hidden else 0)
 
     def do_panic(self):
+        if self.last_server_mode_safe:
+            self.set_status("(safe mode) panic suppressed.")
+            return
+            
         self.set_status("PANIC pressed!")
+        eid = uuid.uuid4().hex
+        self.kill_events[eid] = time.monotonic()
         self.execute_kill("local panic")
-        self.send_ts({"type": "panic"})
+        self.send_ts({"type": "panic", "event_id": eid})
+        if self.mesh and self.mesh.transport:
+            self.mesh.broadcast({
+                "type": "peer_kill",
+                "eid": eid,
+                "cause": "panic",
+                "reason": f"Panic triggered by {self.username}"
+            })
         self.armed = False
 
     def _register_panic(self):
@@ -313,10 +351,31 @@ class Client:
         elif mtype == "roster":
             self.roster = data.get("clients", [])
             self.server_mode = data.get("server_mode", "normal")
+            self.last_server_mode_safe = (self.server_mode == "safe")
+            
+            if self.mesh and self.mesh.transport:
+                changed = False
+                for c in self.roster:
+                    uid = c.get("uuid")
+                    if uid and uid != self.uuid and c.get("ip") and c.get("mesh_port"):
+                        is_new = uid not in self.mesh.peers
+                        self.mesh.upsert_peer(uid, c["ip"], c["mesh_port"], c.get("username", "Unknown"))
+                        if is_new:
+                            self.mesh.send_hello_all()
+                            
+                        # update config cache
+                        if uid not in self.config["known_peers"]:
+                            self.config["known_peers"][uid] = {"ip": c["ip"], "port": c["mesh_port"], "username": c.get("username", "Unknown")}
+                            changed = True
+                        elif self.config["known_peers"][uid].get("ip") != c["ip"] or self.config["known_peers"][uid].get("port") != c["mesh_port"]:
+                            self.config["known_peers"][uid].update({"ip": c["ip"], "port": c["mesh_port"]})
+                            changed = True
+                if changed:
+                    self.save()
         elif mtype == "ping":
             self.send_ts({"type": "pong", "t": data.get("t")})
         elif mtype == "kill":
-            self.handle_kill(data.get("cause", "?"), data.get("reason", ""))
+            self.handle_kill(data.get("cause", "?"), data.get("reason", ""), event_id=data.get("event_id"))
         elif mtype == "kicked":
             self.armed = False
             self.suspended = True
@@ -386,6 +445,7 @@ class Client:
                         "type": "hello", "username": self.username, "uuid": self.uuid,
                         "password": self.password, "version": PROTOCOL_VERSION,
                         "settings": self.settings, "game_running": self.game_running,
+                        "mesh_port": self.mesh_port if self.mesh_enabled else 0
                     })
                     # Re-announce armed state if we were armed before a drop.
                     if self.armed:
@@ -409,33 +469,84 @@ class Client:
     async def _heartbeat(self, ws):
         while self.connected and not self.stop.is_set():
             try:
-                await ws.send(_json({"type": "heartbeat"}))
+                body = {"type": "heartbeat"}
+                if self.mesh:
+                    body["mesh_seen"] = self.mesh.seen_uuids()
+                await ws.send(_json(body))
             except Exception:
                 break
             await asyncio.sleep(HEARTBEAT_INTERVAL)
 
     async def watchdog_loop(self):
-        """Detect a dead/silent server and self-kill unless told to ignore."""
+        from common import ALONE_CONFIRM, PEER_DISCONNECT_TIMEOUT, DEFAULT_GRACE
+        alone_since = None
         while not self.stop.is_set():
             await asyncio.sleep(0.5)
-            silent = time.monotonic() - self.last_server_msg
+            now = time.monotonic()
+            silent = now - self.last_server_msg
+            server_ok = self.connected and silent <= SERVER_TIMEOUT
+            alive = self.mesh.alive_peers() if self.mesh else []
+
+            prev_mode = self.mode
+            if server_ok:               self.mode = "CONNECTED"
+            elif alive:                 self.mode = "MESH-ONLY"
+            elif self.connected or self.armed:  self.mode = "ALONE"
+            else:                       self.mode = "OFFLINE"
+            
+            if self.mode != prev_mode:
+                if self.mode == "MESH-ONLY":
+                    self.set_status(f"server lost — MESH-ONLY ({len(alive)} peers alive). Still in the run.")
+                elif self.mode == "ALONE" and prev_mode == "MESH-ONLY":
+                    self.set_status("lost server AND all peers — my own link is down.")
+            if self.mode != "ALONE":
+                alone_since = None
+
             if not self.armed:
                 continue
             if self.paused:
-                if silent > SERVER_TIMEOUT:
+                if silent > SERVER_TIMEOUT and not alive:
                     self.timeout_killed = True
                 continue
-            if not self.timeout_killed and silent > SERVER_TIMEOUT:
+            if self.mode == "CONNECTED":
+                continue
+
+            if self.mode == "MESH-ONLY":
+                for p in (self.mesh.peers.values() if self.mesh else []):
+                    if p.mesh_kill_fired or not (p.armed and p.disconnect_kill):
+                        continue
+                    if now - p.last_heard > PEER_DISCONNECT_TIMEOUT + DEFAULT_GRACE:
+                        p.mesh_kill_fired = True
+                        if self.last_server_mode_safe:
+                            self.set_status(f"(safe mode) {p.username} vanished on mesh — kill suppressed.")
+                        else:
+                            self.handle_kill("disconnect",
+                                             f"{p.username} vanished (mesh, server down)",
+                                             event_id=f"meshdisc:{p.uuid}:{int(p.last_ts)}")
+                continue
+
+            # ALONE while armed
+            if alone_since is None:
+                alone_since = now
+                continue
+            if not self.timeout_killed and (now - alone_since) >= ALONE_CONFIRM and silent > SERVER_TIMEOUT:
                 self.timeout_killed = True
                 if self.settings.get("ignore_server_timeout_kills"):
-                    self.set_status("server silent — ignored (toggle on).")
+                    self.set_status("server+peers silent — ignored (toggle on).")
                 else:
-                    self.execute_kill("server stopped responding")
+                    self.execute_kill("lost server and all peers (own connection dead)")
                     self.armed = False
 
     # ---- dashboard ---------------------------------------------------------
     def render(self):
-        conn = Text("● CONNECTED", style="bold green") if self.connected else Text("○ offline", style="bold red")
+        if self.mode == "CONNECTED":
+            conn = Text("● CONNECTED", style="bold green")
+        elif self.mode == "MESH-ONLY":
+            conn = Text("◐ MESH-ONLY", style="bold yellow")
+        elif self.mode == "ALONE":
+            conn = Text("○ ALONE", style="bold red")
+        else:
+            conn = Text("○ offline", style="bold red")
+            
         mode = Text(f"server: {self.server_mode.upper()}",
                     style="bold yellow" if self.server_mode == "safe" else "dim")
         my_state = ("PAUSED" if self.paused else ("ARMED" if self.armed else "idle"))
@@ -453,6 +564,7 @@ class Client:
         table.add_column("Player")
         table.add_column("Conn", justify="center")
         table.add_column("Ping", justify="right")
+        table.add_column("Mesh", justify="center")
         table.add_column("Armed", justify="center")
         for _, label in SETTING_COLS:
             table.add_column(label, justify="center")
@@ -463,16 +575,34 @@ class Client:
         def mark(v):
             return Text("✓", style="green") if v else Text("·", style="dim")
 
-        roster = self.roster or [{
-            "username": self.username, "connected": self.connected,
-            "armed": self.armed, "stale": False, "settings": self.settings,
-            "uuid": self.uuid, "game_running": self.game_running,
-        }]
+        if self.mode == "MESH-ONLY":
+            roster = [{
+                "username": self.username, "connected": True, "armed": self.armed,
+                "stale": False, "settings": self.settings, "uuid": self.uuid,
+                "game_running": self.game_running, "ping_ms": -1
+            }]
+            if self.mesh:
+                for p in self.mesh.alive_peers():
+                    roster.append({
+                        "username": p.username, "connected": True, "armed": p.armed,
+                        "stale": False, "settings": {"disconnect_kill": p.disconnect_kill},
+                        "uuid": p.uuid, "game_running": p.game_running, "ping_ms": -1,
+                        "is_mesh_peer": True
+                    })
+        else:
+            roster = self.roster or [{
+                "username": self.username, "connected": self.connected,
+                "armed": self.armed, "stale": False, "settings": self.settings,
+                "uuid": self.uuid, "game_running": self.game_running,
+            }]
+            
         for c in roster:
             me = c.get("uuid") == self.uuid
             name = Text(c.get("username", "?") + (" (you)" if me else ""),
                         style="bold cyan" if me else "white")
-            if not c.get("connected"):
+            if c.get("is_mesh_peer"):
+                cs = Text("mesh", style="yellow")
+            elif not c.get("connected"):
                 cs = Text("off", style="red")
             elif c.get("stale"):
                 cs = Text("stale", style="yellow")
@@ -486,13 +616,20 @@ class Client:
                 color = "green" if ping_ms < 100 else "yellow" if ping_ms < 250 else "red"
                 ping_txt = Text(f"{int(ping_ms)}ms", style=color)
                 
+            mesh_status = Text("—", style="dim")
+            if not me and self.mesh:
+                if c.get("uuid") in self.mesh.seen_uuids():
+                    mesh_status = Text("✓", style="green")
+                else:
+                    mesh_status = Text("·", style="dim")
+                
             armed = Text("ARM", style="bold green") if c.get("armed") else Text("—", style="dim")
             if not c.get("connected"):
                 game = Text("—", style="dim")
             else:
                 game = Text("RUNNING", style="bold green") if c.get("game_running") else Text("off", style="dim")
             s = c.get("settings", {})
-            row = [name, cs, ping_txt, armed] + [mark(s.get(key)) for key, _ in SETTING_COLS]
+            row = [name, cs, ping_txt, mesh_status, armed] + [mark(s.get(key)) for key, _ in SETTING_COLS]
             if self.server_mode == "safe":
                 row.append(Text("SAFE", style="yellow"))
             row.append(game)
@@ -568,6 +705,33 @@ class Client:
     async def run(self):
         self.loop = asyncio.get_running_loop()
         self.settings = normalize_settings(self.settings)
+        
+        from mesh import MeshTransport
+        def get_heartbeat_body():
+            return {
+                "armed": self.armed,
+                "game": self.game_running,
+                "srv": self.connected and (time.monotonic() - self.last_server_msg) <= SERVER_TIMEOUT,
+                "dk": bool(self.settings.get("disconnect_kill"))
+            }
+        
+        self.mesh = MeshTransport(
+            self.uuid, self.username, self.password, self.mesh_port,
+            self.on_mesh_kill, get_heartbeat_body
+        )
+        if self.mesh_enabled:
+            await self.mesh.start(self.loop)
+            for uid, p in self.config.get("known_peers", {}).items():
+                if uid != self.uuid:
+                    self.mesh.upsert_peer(uid, p.get("ip"), p.get("port"), p.get("username", "Unknown"))
+            self.mesh.send_hello_all()
+            
+        async def firewall_hint_loop():
+            if not self.mesh_enabled or not self.config.get("known_peers"):
+                return
+            await asyncio.sleep(10.0)
+            if self.mesh and self.mesh.transport and not self.mesh.alive_peers() and not self.stop.is_set():
+                self.set_status(f"Mesh: No peers heard. If blocked, run as admin: netsh advfirewall firewall add rule name=\"HeistSync Mesh\" dir=in action=allow protocol=UDP localport={self.mesh_port}")
 
         # Disable window Close button (Alt-F4/X)
         if self.hwnd:
@@ -589,12 +753,17 @@ class Client:
             
         self.set_status(f"Ready. Press [A] to arm. Panic key: {self.panic_keybind}")
         try:
-            self._gather_task = asyncio.gather(
+            tasks = [
                 self.connection_loop(), 
                 self.watchdog_loop(), 
                 self.game_status_loop(),
-                self.tui_loop()
-            )
+                self.tui_loop(),
+                firewall_hint_loop()
+            ]
+            if self.mesh and self.mesh.transport:
+                tasks.append(self.mesh.heartbeat_loop(self.stop))
+                
+            self._gather_task = asyncio.gather(*tasks)
             await self._gather_task
         except asyncio.CancelledError:
             pass
@@ -604,6 +773,8 @@ class Client:
                 keyboard.remove_hotkey("ctrl+shift+h")
             except Exception:
                 pass
+            if self.mesh:
+                self.mesh.stop()
 
 
 # ---- tiny json helpers (avoid importing json in three places) --------------
@@ -640,17 +811,18 @@ def main():
         input("Press Enter to exit...")
         sys.exit(1)
 
+    config = load_config(CONFIG_FILE, CLIENT_DEFAULTS)
+    first_run_setup(config)
+    instance_port = config.get("instance_port", 48201)
+
     import socket
     instance_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        instance_socket.bind(('127.0.0.1', INSTANCE_PORT))
+        instance_socket.bind(('127.0.0.1', instance_port))
     except OSError:
         # Port is in use, another instance is running.
-        instance_socket.sendto(b"UNHIDE", ('127.0.0.1', INSTANCE_PORT))
+        instance_socket.sendto(b"UNHIDE", ('127.0.0.1', instance_port))
         sys.exit(99)
-
-    config = load_config(CONFIG_FILE, CLIENT_DEFAULTS)
-    first_run_setup(config)
 
     while True:
         client = Client(config, instance_socket)

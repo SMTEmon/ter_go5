@@ -5,10 +5,12 @@ setting names can never drift apart.
 import json
 import os
 import uuid
+import hmac
+import hashlib
 
 # Bump this if the wire protocol changes in a breaking way. The server warns
 # when a client connects with a mismatched major version.
-PROTOCOL_VERSION = "2.0"
+PROTOCOL_VERSION = "2.1"
 
 # ---- Timing (seconds) -------------------------------------------------------
 HEARTBEAT_INTERVAL = 0.5   # how often the client pings the server
@@ -16,6 +18,15 @@ SERVER_PING_INTERVAL = 1.0 # how often the server sends a keepalive to clients
 CLIENT_TIMEOUT = 2.5       # server marks a client "stale" after this silence
 SERVER_TIMEOUT = 3.0       # client treats the server as dead after this silence
 DEFAULT_GRACE = 1.0        # disconnect grace window before a disconnect-kill
+
+# ---- Mesh (P2P fallback) ----
+MESH_PORT = 48202               # default UDP port each client binds
+MESH_HEARTBEAT_INTERVAL = 0.5   # peer heartbeat cadence
+PEER_TIMEOUT = 2.5              # peer counts as "alive on mesh" if heard within this
+PEER_DISCONNECT_TIMEOUT = 5.0   # in MESH-ONLY, armed peer silent this long (+grace) => local disconnect-kill
+MESH_HMAC_MAX_SKEW = 10.0       # max |sender ts - local time| accepted
+MESH_EVENT_TTL = 60.0           # kill event_id dedup cache lifetime
+ALONE_CONFIRM = 1.0             # ALONE must persist this long before self-kill
 
 # ---- Per-client settings ----------------------------------------------------
 # These are the values the server treats as authoritative and can override for
@@ -136,6 +147,33 @@ def make_getch():
     return getch
 
 
+# ---- Mesh Datagram Helpers --------------------------------------------------
+#
+# Message Schemas:
+# peer_hello: {"type":"peer_hello","from":"<uuid>","name":"Alice","ts":1770000000.0,"port":48202}
+# peer_heartbeat: {"type":"peer_heartbeat","from":"<uuid>","name":"Alice","ts":1770000000.5,"port":48202,
+#                  "armed":true, "game":true, "srv":true, "dk":false}
+# peer_kill: {"type":"peer_kill","from":"<uuid>","name":"Alice","ts":1770000001.0,
+#             "eid":"<uuid4>", "cause":"panic", "reason":"Panic triggered by Alice"}
+
+def mesh_pack(body: dict, password: str) -> bytes:
+    body_str = json.dumps(body, separators=(",", ":"))
+    sig = hmac.new(password.encode("utf-8"), body_str.encode("utf-8"), hashlib.sha256).hexdigest()
+    return json.dumps({"s": sig, "b": body_str}).encode("utf-8")
+
+def mesh_unpack(datagram: bytes, password: str):
+    """Returns body dict, or None if malformed / bad signature."""
+    try:
+        outer = json.loads(datagram.decode("utf-8"))
+        body_str = outer["b"]
+        expected = hmac.new(password.encode("utf-8"), body_str.encode("utf-8"), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(outer.get("s", ""), expected):
+            return None
+        return json.loads(body_str)
+    except (ValueError, KeyError, TypeError, UnicodeDecodeError):
+        return None
+
+
 CLIENT_DEFAULTS = {
     "username": "",
     "uuid": "",
@@ -144,6 +182,10 @@ CLIENT_DEFAULTS = {
     "password": "changeme",
     "settings": dict(DEFAULT_SETTINGS),
     "panic_keybind": "ctrl+shift+f12",
+    "mesh_enabled": True,
+    "mesh_port": 48202,
+    "instance_port": 48201,
+    "known_peers": {},
 }
 
 SERVER_DEFAULTS = {
@@ -151,6 +193,7 @@ SERVER_DEFAULTS = {
     "port": 8765,
     "password": "changeme",
     "grace_seconds": DEFAULT_GRACE,
+    "mesh_corroboration": True,
     # Remembered per-uuid settings so overrides survive a server restart.
     "saved_settings": {},
     "saved_names": {},
