@@ -390,6 +390,7 @@ class Client:
                 "reason": f"Panic triggered by {self.username}"
             })
         self.armed = False
+        self.send_ts({"type": "disarm"})
 
     def _register_panic(self):
         try:
@@ -537,6 +538,7 @@ class Client:
             await asyncio.sleep(1)
         self.execute_kill("synchronized countdown")
         self.armed = False
+        self.send_ts({"type": "disarm"})
 
     async def _scheduled_countdown(self, delay_s, total_secs):
         if not self.armed:
@@ -556,6 +558,7 @@ class Client:
             
         self.execute_kill("synchronized countdown")
         self.armed = False
+        self.send_ts({"type": "disarm"})
 
     # ---- async loops -------------------------------------------------------
     async def connection_loop(self):
@@ -651,6 +654,7 @@ class Client:
                 self.timeout_killed = True
                 self.execute_kill("lost server and all peers (own connection dead)")
                 self.armed = False
+                self.send_ts({"type": "disarm"})
 
     # ---- dashboard ---------------------------------------------------------
     def render(self):
