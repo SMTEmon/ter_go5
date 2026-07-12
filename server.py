@@ -56,14 +56,13 @@ logging.basicConfig(
     handlers=[RichHandler(console=console, show_path=False, markup=False)],
 )
 log = logging.getLogger("server")
+logging.getLogger("websockets.server").setLevel(logging.CRITICAL)
+logging.getLogger("websockets.protocol").setLevel(logging.CRITICAL)
 
 CONFIG_FILE = "server_config.json"
 
 # Dashboard columns, in display order.
 SETTING_COLS = [
-    ("disconnect_kill", "DiscKill"),
-    ("ignore_disconnect_kills", "IgnDisc"),
-    ("ignore_server_timeout_kills", "IgnSrv"),
     ("ignore_other_panic", "IgnPanic"),
     ("dry_run", "Dry"),
 ]
@@ -93,7 +92,6 @@ class HeistServer:
         self.config = config
         self.clients = {}            # uuid -> ClientRecord
         self.safe_mode = False       # True = suppress ALL server-initiated kills
-        self.grace = float(config.get("grace_seconds", 1.0))
         self.loop = None
 
     # ---- persistence -------------------------------------------------------
@@ -146,7 +144,7 @@ class HeistServer:
                 "mesh_port": rec.mesh_port,
             })
         return {"type": "roster", "server_mode": "safe" if self.safe_mode else "normal",
-                "grace": self.grace, "clients": clients}
+                "clients": clients}
 
     async def push_roster(self):
         await self.broadcast(self.roster_payload())
@@ -170,33 +168,7 @@ class HeistServer:
         log.warning(f"KILL broadcast ({cause}) to armed players: {reason}")
         await self.broadcast(msg, only_armed=True, exclude=exclude)
 
-    async def schedule_disconnect_kill(self, rec, drop_seq=None):
-        """Wait the grace window; if the armed player hasn't returned, kill."""
-        uid, name = rec.uuid, rec.username
-        await asyncio.sleep(self.grace)
-        last_log = 0
-        while True:
-            current = self.clients.get(uid)
-            if current and current.connected:
-                return  # they reconnected in time
-            if drop_seq is not None and getattr(current, 'drop_seq', None) != drop_seq:
-                return
-            if not self.config.get("mesh_corroboration", True):
-                break
-            now = time.monotonic()
-            witnesses = [r.username for r in self.clients.values()
-                         if r.connected and r.uuid != uid
-                         and (now - r.mesh_seen_at) <= CLIENT_TIMEOUT
-                         and uid in r.mesh_seen]
-            if not witnesses:
-                break
-            if now - last_log > 5.0:
-                log.warning(f"{name} lost server link but is mesh-visible to {', '.join(witnesses)}; deferring disconnect kill.")
-                last_log = now
-            await asyncio.sleep(1.0)
-            
-        log.warning(f"Grace expired for {name}; triggering disconnect kill.")
-        await self.trigger_kill("disconnect", f"{name} dropped and did not return")
+
 
     # ---- settings overrides ------------------------------------------------
     async def apply_override(self, rec, key, value):
@@ -273,7 +245,7 @@ class HeistServer:
 
         self.remember(rec)
         await self.send(rec, {
-            "type": "welcome", "your_uuid": uid, "grace": self.grace,
+            "type": "welcome", "your_uuid": uid,
             "server_mode": "safe" if self.safe_mode else "normal",
             "settings": rec.settings, "version": PROTOCOL_VERSION,
         })
@@ -334,13 +306,6 @@ class HeistServer:
         rec.last_heartbeat = time.monotonic()
         log.info(f"{rec.username} disconnected.")
         await self.push_roster()
-        if rec.armed and rec.settings.get("disconnect_kill") and not rec.kicked and not self.safe_mode:
-            if getattr(websocket, "close_code", None) == 1000:
-                log.info(f"{rec.username} closed cleanly; skipping disconnect kill.")
-            else:
-                log.warning(f"Armed {rec.username} dropped; grace timer ({self.grace}s) started.")
-                rec.drop_seq = getattr(rec, 'drop_seq', 0) + 1
-                self.loop.create_task(self.schedule_disconnect_kill(rec, rec.drop_seq))
 
     def armed_count(self):
         return sum(1 for r in self.clients.values() if r.armed and r.connected)
@@ -373,8 +338,7 @@ class HeistServer:
                     if stale:
                         log.warning(f"{rec.username} is not responding (stale heartbeat).")
                 # A client silent for much longer than "stale" is treated as gone:
-                # close its socket so handle_client's finally runs on_disconnect
-                # (which handles the grace window / disconnect-kill correctly).
+                # close its socket so handle_client's finally runs on_disconnect.
                 if (rec.connected and not getattr(rec, "dropping", False)
                         and (now - rec.last_heartbeat) > CLIENT_TIMEOUT * 2):
                     rec.dropping = True
@@ -624,7 +588,7 @@ class ServerConsole:
         header.add_row(
             Text.assemble(("Heist Server  ", "bold cyan"),
                           (f"{len(clients)} clients · {armed} armed", "white")),
-            Text(f"mode: {'SAFE' if safe else 'normal'}   grace: {srv.grace}s",
+            Text(f"mode: {'SAFE' if safe else 'normal'}",
                  style="bold yellow" if safe else "dim"),
         )
 

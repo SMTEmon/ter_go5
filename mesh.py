@@ -25,8 +25,6 @@ class PeerInfo:
     armed: bool = False
     game_running: bool = False
     server_ok: bool = False
-    disconnect_kill: bool = False
-    mesh_kill_fired: bool = False
 
     def alive(self, now: float) -> bool:
         return (now - self.last_heard) <= PEER_TIMEOUT
@@ -168,7 +166,6 @@ class MeshTransport(asyncio.DatagramProtocol):
         p.username = body.get("name", p.username)
         p.last_heard = time.monotonic()
         p.last_ts = ts
-        p.mesh_kill_fired = False
 
         mtype = body.get("type")
         if mtype == "peer_hello":
@@ -181,7 +178,6 @@ class MeshTransport(asyncio.DatagramProtocol):
             p.armed = body.get("armed", False)
             p.game_running = body.get("game", False)
             p.server_ok = body.get("srv", False)
-            p.disconnect_kill = body.get("dk", False)
         elif mtype == "peer_kill":
             cause = body.get("cause", "unknown")
             reason = body.get("reason", "unknown")

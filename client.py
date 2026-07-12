@@ -66,19 +66,13 @@ console = Console()
 
 # Short column labels for the dashboard, in display order.
 SETTING_COLS = [
-    ("disconnect_kill", "DiscKill"),
-    ("ignore_disconnect_kills", "IgnDisc"),
-    ("ignore_server_timeout_kills", "IgnSrv"),
     ("ignore_other_panic", "IgnPanic"),
     ("dry_run", "Dry"),
 ]
 # Number-key -> setting, for the local menu.
 TOGGLE_KEYS = {
-    "1": "disconnect_kill",
-    "2": "ignore_disconnect_kills",
-    "3": "ignore_server_timeout_kills",
-    "4": "ignore_other_panic",
-    "5": "dry_run",
+    "1": "ignore_other_panic",
+    "2": "dry_run",
 }
 
 
@@ -183,7 +177,6 @@ class Client:
             self.set_status(f"({prefix}) ignored kill [{cause}] — {reason}")
             return
         ignore = {
-            "disconnect": "ignore_disconnect_kills",
             "panic": "ignore_other_panic",
         }.get(cause)
         if ignore and self.settings.get(ignore):
@@ -533,7 +526,7 @@ class Client:
             await asyncio.sleep(HEARTBEAT_INTERVAL)
 
     async def watchdog_loop(self):
-        from common import ALONE_CONFIRM, PEER_DISCONNECT_TIMEOUT, DEFAULT_GRACE
+        from common import ALONE_CONFIRM
         alone_since = None
         while not self.stop.is_set():
             await asyncio.sleep(0.5)
@@ -566,17 +559,6 @@ class Client:
                 continue
 
             if self.mode == "MESH-ONLY":
-                for p in (self.mesh.peers.values() if self.mesh else []):
-                    if p.mesh_kill_fired or not (p.armed and p.disconnect_kill):
-                        continue
-                    if now - p.last_heard > PEER_DISCONNECT_TIMEOUT + DEFAULT_GRACE:
-                        p.mesh_kill_fired = True
-                        if self.last_server_mode_safe:
-                            self.set_status(f"(safe mode) {p.username} vanished on mesh — kill suppressed.")
-                        else:
-                            self.handle_kill("disconnect",
-                                             f"{p.username} vanished (mesh, server down)",
-                                             event_id=f"meshdisc:{p.uuid}:{int(p.last_ts)}")
                 continue
 
             # ALONE while armed
@@ -585,11 +567,8 @@ class Client:
                 continue
             if not self.timeout_killed and (now - alone_since) >= ALONE_CONFIRM and silent > SERVER_TIMEOUT:
                 self.timeout_killed = True
-                if self.settings.get("ignore_server_timeout_kills"):
-                    self.set_status("server+peers silent — ignored (toggle on).")
-                else:
-                    self.execute_kill("lost server and all peers (own connection dead)")
-                    self.armed = False
+                self.execute_kill("lost server and all peers (own connection dead)")
+                self.armed = False
 
     # ---- dashboard ---------------------------------------------------------
     def render(self):
@@ -640,7 +619,7 @@ class Client:
                 for p in self.mesh.alive_peers():
                     roster.append({
                         "username": p.username, "connected": True, "armed": p.armed,
-                        "stale": False, "settings": {"disconnect_kill": p.disconnect_kill},
+                        "stale": False, "settings": {},
                         "uuid": p.uuid, "game_running": p.game_running, "ping_ms": -1,
                         "is_mesh_peer": True
                     })
@@ -697,7 +676,7 @@ class Client:
 
         s_hint = "  [S]Drop Safe Mode" if self.mode == "MESH-ONLY" and self.last_server_mode_safe else ""
         legend = ("[A]rm  [D]isarm  [P]ause  "
-                  "[1]DiscKill [2]IgnDisc [3]IgnSrv [4]IgnPanic [5]Dry  "
+                  "[1]IgnPanic [2]Dry  "
                   f"[K] Rebind panic  [H]ide  [R]estart  [Q]uit{s_hint}")
         panic = Text(f"Panic key: {self.panic_keybind}", style="bold red")
         status = Text(self.status, style="italic")
@@ -779,7 +758,6 @@ class Client:
                 "armed": self.armed,
                 "game": self.game_running,
                 "srv": self.connected and (time.monotonic() - self.last_server_msg) <= SERVER_TIMEOUT,
-                "dk": bool(self.settings.get("disconnect_kill"))
             }
         
         self.mesh = MeshTransport(

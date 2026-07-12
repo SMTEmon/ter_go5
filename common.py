@@ -13,17 +13,15 @@ import hashlib
 PROTOCOL_VERSION = "2.1"
 
 # ---- Timing (seconds) -------------------------------------------------------
-HEARTBEAT_INTERVAL = 0.5   # how often the client pings the server
-SERVER_PING_INTERVAL = 1.0 # how often the server sends a keepalive to clients
-CLIENT_TIMEOUT = 2.5       # server marks a client "stale" after this silence
-SERVER_TIMEOUT = 3.0       # client treats the server as dead after this silence
-DEFAULT_GRACE = 1.0        # disconnect grace window before a disconnect-kill
+HEARTBEAT_INTERVAL = 1.0   # how often the client pings the server
+SERVER_PING_INTERVAL = 2.0 # how often the server sends a keepalive to clients
+CLIENT_TIMEOUT = 10.0      # server marks a client "stale" after this silence
+SERVER_TIMEOUT = 15.0      # client treats the server as dead after this silence
 
 # ---- Mesh (P2P fallback) ----
 MESH_PORT = 48202               # default UDP port each client binds
-MESH_HEARTBEAT_INTERVAL = 0.5   # peer heartbeat cadence
-PEER_TIMEOUT = 2.5              # peer counts as "alive on mesh" if heard within this
-PEER_DISCONNECT_TIMEOUT = 5.0   # in MESH-ONLY, armed peer silent this long (+grace) => local disconnect-kill
+MESH_HEARTBEAT_INTERVAL = 1.0   # peer heartbeat cadence
+PEER_TIMEOUT = 10.0             # peer counts as "alive on mesh" if heard within this
 MESH_HMAC_MAX_SKEW = 120.0       # max |sender ts - local time| accepted
 MESH_EVENT_TTL = 60.0           # kill event_id dedup cache lifetime
 ALONE_CONFIRM = 1.0             # ALONE must persist this long before self-kill
@@ -33,18 +31,12 @@ ALONE_CONFIRM = 1.0             # ALONE must persist this long before self-kill
 # any client (individually or all at once). Booleans only, so the `set` CLI
 # command stays trivial. panic_keybind is client-local (not server-set).
 DEFAULT_SETTINGS = {
-    "disconnect_kill": False,            # my drop should kill everyone (after grace)
-    "ignore_disconnect_kills": False,    # don't kill my game on someone's disconnect
-    "ignore_server_timeout_kills": False,# don't kill my game if the server goes silent
     "ignore_other_panic": False,         # don't kill my game on another player's panic
     "dry_run": False,                    # log kills instead of actually closing GTA
 }
 
 # Human-readable descriptions, shown in the dashboards / help.
 SETTINGS_HELP = {
-    "disconnect_kill": "My unexpected drop triggers a kill for everyone",
-    "ignore_disconnect_kills": "Ignore kills caused by a player disconnecting",
-    "ignore_server_timeout_kills": "Ignore kills caused by the server going silent",
     "ignore_other_panic": "Ignore kills caused by another player's panic",
     "dry_run": "Test mode: log kills instead of closing GTA",
 }
@@ -192,7 +184,6 @@ SERVER_DEFAULTS = {
     "host": "0.0.0.0",
     "port": 8765,
     "password": "changeme",
-    "grace_seconds": DEFAULT_GRACE,
     "mesh_corroboration": True,
     # Remembered per-uuid settings so overrides survive a server restart.
     "saved_settings": {},
