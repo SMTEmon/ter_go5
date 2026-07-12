@@ -27,6 +27,73 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
+from ctypes import wintypes
+
+def parse_hotkey_string(key_str):
+    """Parse a string like 'ctrl+shift+k' to (modifiers, vk_code)."""
+    parts = [p.strip().lower() for p in key_str.split('+')]
+    mods = 0
+    vk = 0
+    MOD_ALT = 0x0001
+    MOD_CONTROL = 0x0002
+    MOD_SHIFT = 0x0004
+    MOD_WIN = 0x0008
+    
+    special_keys = {
+        'f1': 0x70, 'f2': 0x71, 'f3': 0x72, 'f4': 0x73, 'f5': 0x74, 'f6': 0x75,
+        'f7': 0x76, 'f8': 0x77, 'f9': 0x78, 'f10': 0x79, 'f11': 0x7A, 'f12': 0x7B,
+        'enter': 0x0D, 'esc': 0x1B, 'escape': 0x1B, 'space': 0x20, 'backspace': 0x08,
+        'tab': 0x09, 'delete': 0x2E, 'insert': 0x2D, 'home': 0x24, 'end': 0x23,
+        'page up': 0x21, 'page down': 0x22, 'pgup': 0x21, 'pgdn': 0x22,
+    }
+    
+    for p in parts:
+        if p in ('ctrl', 'control'): mods |= MOD_CONTROL
+        elif p in ('shift',): mods |= MOD_SHIFT
+        elif p in ('alt',): mods |= MOD_ALT
+        elif p in ('win', 'windows'): mods |= MOD_WIN
+        else:
+            if p in special_keys:
+                vk = special_keys[p]
+            elif len(p) == 1:
+                res = ctypes.windll.user32.VkKeyScanW(ord(p))
+                if res != -1:
+                    vk = res & 0xFF
+    return mods, vk
+
+class NativeHotkeyThread(threading.Thread):
+    """Fallback hotkey using RegisterHotKey to bypass BattlEye hook blocks."""
+    def __init__(self, key_str, callback):
+        super().__init__(daemon=True)
+        self.key_str = key_str
+        self.callback = callback
+        self.thread_id = None
+        self.registered = False
+        
+    def run(self):
+        self.thread_id = threading.get_native_id()
+        mods, vk = parse_hotkey_string(self.key_str)
+        if not vk:
+            return
+            
+        user32 = ctypes.windll.user32
+        # Use hotkey id = 1
+        if not user32.RegisterHotKey(None, 1, mods, vk):
+            return
+            
+        self.registered = True
+        msg = wintypes.MSG()
+        while user32.GetMessageA(ctypes.byref(msg), None, 0, 0) != 0:
+            if msg.message == 0x0312:  # WM_HOTKEY
+                if msg.wParam == 1:
+                    self.callback()
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageA(ctypes.byref(msg))
+            
+    def stop(self):
+        if self.registered and self.thread_id:
+            ctypes.windll.user32.PostThreadMessageA(self.thread_id, 0x0012, 0, 0) # WM_QUIT
+
 
 from common import (
     PROTOCOL_VERSION, HEARTBEAT_INTERVAL, SERVER_TIMEOUT,
@@ -79,7 +146,7 @@ TOGGLE_KEYS = {
 
 def kill_processes():
     """Actually close GTA5 (Enhanced + BattlEye variants)."""
-    names = ["GTA5_Enhanced.exe", "GTA5_Enhanced_BE.exe", "GTA5.exe", "PlayGTAV.exe"]
+    names = ["GTA5_Enhanced.exe", "GTA5_Enhanced_BE.exe", "GTA5.exe", "PlayGTAV.exe", "BEService.exe", "Launcher.exe"]
     for name in names:
         if sys.platform == "win32":
             subprocess.run(["taskkill", "/F", "/IM", name],
@@ -111,6 +178,7 @@ class Client:
         self.websocket = None
         self.connected = False
         self.armed = False
+        self.native_hotkey_thread = None
         self.paused = False
         self.rebinding = False
         self.stop = threading.Event()
@@ -184,6 +252,7 @@ class Client:
             return
         self.execute_kill(reason)
         self.armed = False  # drop to ready state; re-arm to rejoin
+        self.send_ts({"type": "disarm"})
 
     def on_mesh_kill(self, cause, reason, event_id, from_name):
         self.handle_kill(cause, f"{reason} (via mesh from {from_name})", event_id)
@@ -238,6 +307,9 @@ class Client:
             keyboard.remove_hotkey(self.panic_keybind)
         except Exception:
             pass
+        if self.native_hotkey_thread:
+            self.native_hotkey_thread.stop()
+            self.native_hotkey_thread = None
         try:
             new_key = keyboard.read_hotkey(suppress=False)
         except Exception:
@@ -296,6 +368,11 @@ class Client:
         ctypes.windll.user32.ShowWindow(self.hwnd, 1 if not self.hidden else 0)
 
     def do_panic(self):
+        now = time.monotonic()
+        if hasattr(self, "_last_panic") and now - self._last_panic < 1.0:
+            return
+        self._last_panic = now
+        
         if self.last_server_mode_safe:
             self.set_status("(safe mode) panic suppressed.")
             return
@@ -319,6 +396,11 @@ class Client:
             keyboard.add_hotkey(self.panic_keybind, self.do_panic)
         except Exception as e:
             self.set_status(f"couldn't bind panic key: {e}")
+            
+        if self.native_hotkey_thread:
+            self.native_hotkey_thread.stop()
+        self.native_hotkey_thread = NativeHotkeyThread(self.panic_keybind, self.do_panic)
+        self.native_hotkey_thread.start()
 
     def _sync_check_game(self):
         try:
@@ -662,7 +744,8 @@ class Client:
                     else:
                         mesh_status = Text("·", style="dim")
                 
-            armed = Text("ARM", style="bold green") if c.get("armed") else Text("—", style="dim")
+            is_armed = self.armed if me else c.get("armed")
+            armed = Text("ARM", style="bold green") if is_armed else Text("—", style="dim")
             if not c.get("connected"):
                 game = Text("—", style="dim")
             else:
@@ -818,6 +901,9 @@ class Client:
                 keyboard.remove_hotkey("ctrl+shift+h")
             except Exception:
                 pass
+            if self.native_hotkey_thread:
+                self.native_hotkey_thread.stop()
+                self.native_hotkey_thread = None
             if self.mesh:
                 self.mesh.stop()
 
