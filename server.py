@@ -37,6 +37,17 @@ if os.name == "nt":
         sys.stdout.reconfigure(encoding="utf-8")
     except Exception:
         pass
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-10)
+        mode = ctypes.c_uint32()
+        kernel32.GetConsoleMode(handle, ctypes.byref(mode))
+        mode.value &= ~0x0040
+        mode.value |= 0x0080
+        kernel32.SetConsoleMode(handle, mode)
+    except Exception:
+        pass
 
 console = Console()
 # RichHandler prints log lines *above* the live dashboard instead of clobbering it.
