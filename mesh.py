@@ -143,6 +143,10 @@ class MeshTransport(asyncio.DatagramProtocol):
         ts = body.get("ts", 0.0)
         local_ts = time.time()
         if abs(local_ts - ts) > MESH_HMAC_MAX_SKEW:
+            now = time.monotonic()
+            if now - getattr(self, "last_skew_warning", 0.0) > 30.0:
+                log.warning(f"Dropped mesh datagram from {addr} (clock skew > {MESH_HMAC_MAX_SKEW}s). Check system time.")
+                self.last_skew_warning = now
             return
 
         if sender_uuid not in self.peers:

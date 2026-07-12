@@ -24,7 +24,7 @@ MESH_PORT = 48202               # default UDP port each client binds
 MESH_HEARTBEAT_INTERVAL = 0.5   # peer heartbeat cadence
 PEER_TIMEOUT = 2.5              # peer counts as "alive on mesh" if heard within this
 PEER_DISCONNECT_TIMEOUT = 5.0   # in MESH-ONLY, armed peer silent this long (+grace) => local disconnect-kill
-MESH_HMAC_MAX_SKEW = 10.0       # max |sender ts - local time| accepted
+MESH_HMAC_MAX_SKEW = 120.0       # max |sender ts - local time| accepted
 MESH_EVENT_TTL = 60.0           # kill event_id dedup cache lifetime
 ALONE_CONFIRM = 1.0             # ALONE must persist this long before self-kill
 

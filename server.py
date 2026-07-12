@@ -200,11 +200,15 @@ class HeistServer:
         try:
             raw = await asyncio.wait_for(websocket.recv(), timeout=10)
             hello = json.loads(raw)
+            if hello.get("type") != "hello":
+                return
+            if hello.get("password") != self.config["password"]:
+                await websocket.send(json.dumps({"type": "auth_failed", "reason": "Incorrect password"}))
+                return
+            if str(hello.get("version")) != PROTOCOL_VERSION:
+                await websocket.send(json.dumps({"type": "auth_failed", "reason": f"Version mismatch (Server: {PROTOCOL_VERSION}, Client: {hello.get('version')})"}))
+                return
         except Exception:
-            return
-
-        if hello.get("type") != "hello" or hello.get("password") != self.config["password"]:
-            await websocket.send(json.dumps({"type": "auth_failed", "reason": "Bad password or handshake"}))
             log.info(f"Rejected connection from {websocket.remote_address[0]} (auth).")
             return
 
@@ -399,6 +403,18 @@ class HeistServer:
             if self.safe_mode:
                 schedule(self.broadcast({"type": "countdown_abort"}, only_armed=True))
             schedule(self.push_roster())
+        elif cmd.startswith("restart"):
+            _, target = line.split(maxsplit=1)
+            targets = []
+            if target == "all":
+                targets = [c for c in self.clients.values() if c.connected]
+            else:
+                for c in self.clients.values():
+                    if c.connected and (c.username.lower() == target or c.uuid.startswith(target)):
+                        targets.append(c)
+            for c in targets:
+                schedule(self.send(c, {"type": "restart"}))
+            log.info(f"Sent restart command to {len(targets)} client(s).")
         elif cmd == "kill":
             if not args:
                 log.info("usage: kill <user>")
@@ -420,8 +436,15 @@ class HeistServer:
             secs = int(args[0]) if args and args[0].isdigit() else 5
             if self.armed_count() == 0:
                 log.info("Warning: No clients are ARMED. Countdown won't do anything!")
-            schedule(self.broadcast({"type": "countdown", "seconds": secs}, only_armed=True))
-            log.info(f"Countdown ({secs}s) sent to armed players.")
+                
+            target_time = time.monotonic() + secs
+            for rec in self.clients.values():
+                if not rec.connected or not rec.armed:
+                    continue
+                half_rtt = (rec.ping_ms / 1000.0 / 2.0) if rec.ping_ms > 0 else 0.05
+                delay = max(0.0, target_time - time.monotonic() - half_rtt)
+                schedule(self.send(rec, {"type": "scheduled_kill", "delay_s": delay, "seconds": secs}))
+            log.info(f"Countdown ({secs}s) dispatched with latency compensation.")
         elif cmd == "set":
             self.do_set(args, schedule)
         elif cmd == "forget":
@@ -545,7 +568,7 @@ class ServerConsole:
         parts = buf.split()
         cmd = parts[0].lower() if parts else ""
         if not buf:
-            return "Commands: arm, disarm, pause, unpause, safe, kill, kick, set, countdown, help"
+            return "Commands: arm, disarm, pause, unpause, safe, kill, kick, restart, set, countdown, help"
         
         if "safe".startswith(cmd):
             return "safe [on|off] - suppress ALL kills"
@@ -561,6 +584,8 @@ class ServerConsole:
             return "kill <user> - targeted kill of one player only"
         elif "kick".startswith(cmd):
             return "kick <user> - remove from session; game keeps running"
+        elif "restart".startswith(cmd):
+            return "restart <user|all> - force client(s) to restart script"
         elif "set".startswith(cmd):
             if len(parts) == 1 or (len(parts) == 2 and not buf.endswith(" ")):
                 return "set <user|all> <setting> <on|off>"

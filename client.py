@@ -273,6 +273,11 @@ class Client:
             if hasattr(self, "_gather_task"):
                 self.loop.call_soon_threadsafe(self._gather_task.cancel)
 
+    def action_restart(self):
+        self.needs_restart = True
+        self.action_quit()
+        self.set_status("Restarting and checking for updates...")
+
     def action_hide(self):
         if not self.hwnd: return
         if not getattr(self, "unhide_bound", True):
@@ -390,6 +395,12 @@ class Client:
             if hasattr(self, "_countdown_task") and not self._countdown_task.done():
                 self._countdown_task.cancel()
             self._countdown_task = self.loop.create_task(self._countdown(int(data.get("seconds", 5))))
+        elif mtype == "scheduled_kill":
+            if hasattr(self, "_countdown_task") and not self._countdown_task.done():
+                self._countdown_task.cancel()
+            self._countdown_task = self.loop.create_task(
+                self._scheduled_countdown(data.get("delay_s", 5.0), data.get("seconds", 5))
+            )
         elif mtype == "countdown_abort":
             if hasattr(self, "_countdown_task") and not self._countdown_task.done():
                 self._countdown_task.cancel()
@@ -413,6 +424,20 @@ class Client:
         elif mtype == "auth_failed":
             self.auth_failed_reason = data.get('reason','')
             self.stop.set()
+        elif mtype == "restart":
+            self.set_status("Server requested client restart. Restarting...")
+            self.stop.set()
+            self.needs_restart = True
+            async def _restart_clean():
+                self.armed = False
+                await self._send({"type": "disarm"})
+                try:
+                    await asyncio.wait_for(self.websocket.close(code=1000), timeout=1.5)
+                except Exception:
+                    pass
+                if hasattr(self, "_gather_task"):
+                    self.loop.call_soon_threadsafe(self._gather_task.cancel)
+            asyncio.run_coroutine_threadsafe(_restart_clean(), self.loop)
 
     async def _countdown(self, seconds):
         for n in range(seconds, 0, -1):
@@ -424,6 +449,25 @@ class Client:
                 return
             self.set_status(f"SYNCHRONIZED KILL IN {n}...")
             await asyncio.sleep(1)
+        self.execute_kill("synchronized countdown")
+        self.armed = False
+
+    async def _scheduled_countdown(self, delay_s, total_secs):
+        if not self.armed:
+            self.set_status("(disarmed) countdown ignored.")
+            return
+        if self.paused:
+            self.set_status("(paused) countdown ignored.")
+            return
+            
+        end_time = time.monotonic() + delay_s
+        while True:
+            remaining = end_time - time.monotonic()
+            if remaining <= 0:
+                break
+            self.set_status(f"SYNCHRONIZED KILL IN {max(1, int(remaining))}s (Latency adjusted)...")
+            await asyncio.sleep(min(1.0, remaining))
+            
         self.execute_kill("synchronized countdown")
         self.armed = False
 
@@ -617,11 +661,16 @@ class Client:
                 ping_txt = Text(f"{int(ping_ms)}ms", style=color)
                 
             mesh_status = Text("—", style="dim")
-            if not me and self.mesh:
-                if c.get("uuid") in self.mesh.seen_uuids():
-                    mesh_status = Text("✓", style="green")
+            if self.mesh:
+                if me:
+                    mesh_count = len(self.mesh.alive_peers())
+                    if mesh_count > 0:
+                        mesh_status = Text(f"{mesh_count}✓", style="green")
                 else:
-                    mesh_status = Text("·", style="dim")
+                    if c.get("uuid") in self.mesh.seen_uuids():
+                        mesh_status = Text("✓", style="green")
+                    else:
+                        mesh_status = Text("·", style="dim")
                 
             armed = Text("ARM", style="bold green") if c.get("armed") else Text("—", style="dim")
             if not c.get("connected"):
@@ -635,9 +684,10 @@ class Client:
             row.append(game)
             table.add_row(*row)
 
+        s_hint = "  [S]Drop Safe Mode" if self.mode == "MESH-ONLY" and self.last_server_mode_safe else ""
         legend = ("[A]rm  [D]isarm  [P]ause  "
                   "[1]DiscKill [2]IgnDisc [3]IgnSrv [4]IgnPanic [5]Dry  "
-                  "[K] Rebind panic  [H]ide  [Q]uit")
+                  f"[K] Rebind panic  [H]ide  [R]estart  [Q]uit{s_hint}")
         panic = Text(f"Panic key: {self.panic_keybind}", style="bold red")
         status = Text(self.status, style="italic")
 
@@ -697,6 +747,12 @@ class Client:
                 self.action_rebind_panic()
             elif c == "h":
                 self.action_hide()
+            elif c == "s" and self.mode == "MESH-ONLY" and self.last_server_mode_safe:
+                self.last_server_mode_safe = False
+                self.set_status("Dropped cached safe mode. Panics will now work.")
+            elif c == "r":
+                self.action_restart()
+                break
             elif c == "q":
                 self.action_quit()
                 break
@@ -797,9 +853,8 @@ def first_run_setup(config):
     
     if config.get("password") == "changeme":
         pw = input("Shared password (press Enter if host removed the password): ").strip()
-        if pw:
-            config["password"] = pw
-            changed = True
+        config["password"] = pw
+        changed = True
 
     if changed:
         save_config(CONFIG_FILE, config)
@@ -841,6 +896,19 @@ def main():
                     save_config(CONFIG_FILE, config)
             except (EOFError, KeyboardInterrupt):
                 break
+        elif getattr(client, "needs_restart", False):
+            print("\nRestarting client as requested by server...")
+            try:
+                instance_socket.close()
+            except Exception:
+                pass
+            print("Checking for updates...")
+            import subprocess
+            try:
+                subprocess.call(["git", "pull"])
+            except Exception as e:
+                print(f"Update failed: {e}")
+            os.execv(sys.executable, [sys.executable] + sys.argv)
         else:
             break
             
